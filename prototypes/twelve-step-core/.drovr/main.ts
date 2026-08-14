@@ -10,6 +10,8 @@
  * - Worker control path: `start({ name, cwd })` then `worker.prompt(text)`
  * - `--resume` re-runs this file from the top; start / worktree / lease / claim reconnect by Name
  * - A map item leases a Resource only when it needs one; omit the lease block otherwise
+ * - A real workflow is `import type { Drovr } from "drovr"` plus the default export below
+ * - `list()` with no arguments: open `ready-for-agent`, unassigned or already claimed here
  */
 
 // --- proposed library surface (what `drovr` would export) ---
@@ -39,6 +41,7 @@ export type Drovr = {
 }
 
 // --- what a project actually puts in `.drovr/main.ts` ---
+// import type { Drovr } from "drovr"
 
 export default async function (drovr: Drovr) {
   const supabase = await drovr.resource('supabase', { capacity: 1 })
