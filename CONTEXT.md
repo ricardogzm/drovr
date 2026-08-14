@@ -17,7 +17,7 @@ A persistent OMP session Drovr can prompt more than once, shown in a Herdr pane.
 _Avoid_: agent execution, subagent (when meaning the live session)
 
 **Name**:
-The user-supplied git-safe slug that keys a Worker, Worktree, and Resource lease so a second pass reconnects instead of duplicating. Legal characters are `A-Za-z0-9._-`; it must not start with `.` or `-`.
+The user-supplied slug that keys a Worker, Worktree, and Resource lease so a second pass reconnects instead of duplicating. It is also the live Herdr agent name: `[a-z][a-z0-9_-]{0,31}` — lowercase, 1–32 characters, starting with a letter. Illegal Names fail immediately; Drovr does not slugify.
 _Avoid_: task id, run id (as the reconnect key)
 
 **Start checkout**:
