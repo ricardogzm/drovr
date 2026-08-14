@@ -9,6 +9,7 @@
  * - Worktree: pass only Name; path / branch / cut are derived
  * - Worker control path: `start({ name, cwd })` then `worker.prompt(text)`
  * - `--resume` re-runs this file from the top; start / worktree / lease / claim reconnect by Name
+ * - A map item leases a Resource only when it needs one; omit the lease block otherwise
  */
 
 // --- proposed library surface (what `drovr` would export) ---
@@ -53,6 +54,7 @@ export default async function (drovr: Drovr) {
 
     const worker = await drovr.start({ name, cwd: worktree.path })
 
+    // Lease only when this item needs the scarce environment. Omit the block otherwise.
     await supabase.lease({ name }, async () => {
       await worker.prompt(`Worktree is ${worktree.path}. Implement ${issue.url} (${issue.title}).`)
       await worker.prompt('If the change is complete, commit on this branch. Do not push.')
