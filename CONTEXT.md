@@ -17,7 +17,7 @@ A persistent OMP session Drovr can prompt more than once, shown in a Herdr pane.
 _Avoid_: agent execution, subagent (when meaning the live session)
 
 **Name**:
-The user-supplied slug that keys a Worker, Worktree, and Resource lease so a second pass reconnects instead of duplicating. It is also the live Herdr agent name: `[a-z][a-z0-9_-]{0,31}` — lowercase, 1–32 characters, starting with a letter. Illegal Names fail immediately; Drovr does not slugify.
+The user-supplied slug that keys a Worker, Worktree, Claim, and Resource lease so a second pass reconnects instead of duplicating. It is also the live Herdr agent name: `[a-z][a-z0-9_-]{0,31}` — lowercase, 1–32 characters, starting with a letter. Illegal Names fail immediately; Drovr does not slugify.
 _Avoid_: task id, run id (as the reconnect key)
 
 **Start checkout**:
@@ -32,10 +32,22 @@ _Avoid_: sandbox, clone (as the isolation unit)
 A named, capacity-limited lock Drovr leases so scarce environments are not used in parallel. Capacity is defined before the first lease.
 _Avoid_: mutex, semaphore (as the domain name)
 
+**Lease**:
+One Name occupying one slot of a Resource.
+_Avoid_: lock, hold, reservation (when meaning a Resource slot)
+
 **Issue**:
-A GitHub issue the workflow can list or claim via the `gh` CLI. User code maps over issues and starts workers; Drovr does not wrap them in its own task type.
+A GitHub issue the workflow can list, claim, or close via the `gh` CLI. User code maps over issues and starts workers; Drovr does not wrap them in its own task type.
 _Avoid_: Task, TaskSource
 
 **Claim**:
-Durable ownership of an Issue by a Workflow Name, reserved in the project database and shown on GitHub by assigning the authenticated user. A Claim remains until explicitly released.
+Durable ownership of an Issue by a Workflow Name, reserved in the project database and shown on GitHub by assigning the authenticated user. A Claim remains until the Workflow closes the Issue or otherwise releases it.
 _Avoid_: lock, checkout
+
+**Close**:
+A Workflow call that closes the GitHub Issue and releases its Claim.
+_Avoid_: complete, finish
+
+**Project database**:
+The SQLite file shared by Drovr processes in one Start checkout. It is the collision boundary for Claims and Leases.
+_Avoid_: state file, global store, ~/.drovr
