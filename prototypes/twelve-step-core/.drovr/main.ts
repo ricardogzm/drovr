@@ -13,6 +13,7 @@
  * - A real workflow is `import type { Drovr } from "drovr"` plus the default export below
  * - `list()` with no arguments: open `ready-for-agent`, unassigned or already claimed here
  * - Returning from the map callback marks that Name complete; a throw replays both prompts
+ * - Commit is a Worker prompt; close is `drovr.issues.close(issue)` after the lease
  */
 
 // --- proposed library surface (what `drovr` would export) ---
@@ -38,6 +39,7 @@ export type Drovr = {
   issues: {
     list(opts?: { repo?: string }): Promise<Issue[]>
     claim(issue: Issue, opts: { name: Name }): Promise<void>
+    close(issue: Issue): Promise<void>
   }
 }
 
@@ -63,7 +65,7 @@ export default async function (drovr: Drovr) {
       await worker.prompt(`Worktree is ${worktree.path}. Implement ${issue.url} (${issue.title}).`)
       await worker.prompt('If the change is complete, commit on this branch. Do not push.')
     })
-    // Close is still open: the workflow must explicitly commit and close so a later
-    // `drovr start` does not pick the Issue up again.
+
+    await drovr.issues.close(issue)
   })
 }
