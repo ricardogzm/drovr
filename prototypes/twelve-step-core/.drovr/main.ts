@@ -12,6 +12,7 @@
  * - A map item leases a Resource only when it needs one; omit the lease block otherwise
  * - A real workflow is `import type { Drovr } from "drovr"` plus the default export below
  * - `list()` with no arguments: open `ready-for-agent`, unassigned or already claimed here
+ * - Returning from the map callback marks that Name complete; a throw replays both prompts
  */
 
 // --- proposed library surface (what `drovr` would export) ---
@@ -62,5 +63,7 @@ export default async function (drovr: Drovr) {
       await worker.prompt(`Worktree is ${worktree.path}. Implement ${issue.url} (${issue.title}).`)
       await worker.prompt('If the change is complete, commit on this branch. Do not push.')
     })
+    // Close is still open: the workflow must explicitly commit and close so a later
+    // `drovr start` does not pick the Issue up again.
   })
 }
