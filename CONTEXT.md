@@ -41,12 +41,16 @@ A GitHub issue the workflow can list, claim, or close via the `gh` CLI. User cod
 _Avoid_: Task, TaskSource
 
 **Claim**:
-Durable ownership of an Issue by a Workflow Name, reserved in the project database and shown on GitHub by assigning the authenticated user. A Claim remains until the Workflow closes the Issue or otherwise releases it.
+Durable ownership of an Issue by a Workflow Name. Claiming assigns the authenticated GitHub user, but that assignment may remain after the Claim ends.
 _Avoid_: lock, checkout
 
 **Close**:
-A Workflow call that closes the GitHub Issue and releases its Claim.
+A Workflow call that closes the GitHub Issue and releases its Claim while retaining its assignee and readiness label.
 _Avoid_: complete, finish
+
+**Release**:
+A Workflow call that releases a Claim without closing or unassigning the Issue, handing responsibility to the retained assignee rather than requeueing it.
+_Avoid_: unclaim, requeue
 
 **Completion**:
 A Name whose map callback returned, recorded in the project database so `--resume` skips it. A throw is not a Completion.
