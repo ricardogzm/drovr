@@ -24,11 +24,11 @@
     "build": "tsdown",
     "dev": "tsdown --watch",
     "test": "vitest",
-    "typecheck": "tsc --noEmit",
     "lint": "oxlint",
     "lint:fix": "oxlint --fix",
     "fmt": "oxfmt",
     "fmt:check": "oxfmt --check",
+    "check": "pnpm run typecheck && pnpm run lint",
     "release": "bumpp",
     "prepublishOnly": "pnpm run build",
     "prepare": "husky"
@@ -40,6 +40,7 @@
     "lint-staged": "^17.3.0",
     "oxfmt": "^0.63.0",
     "oxlint": "^1.78.0",
+    "oxlint-tsgolint": "^7.0.2001",
     "tsdown": "^0.22.5",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"
