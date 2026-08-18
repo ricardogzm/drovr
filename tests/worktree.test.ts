@@ -1226,4 +1226,99 @@ export default async function workflow(drovr: Drovr): Promise<void> {
       await rm(repo, { recursive: true, force: true })
     }
   })
+
+  it('fails safely without mutation when a missing worktree registration is locked', async () => {
+    const repo = await initRepo()
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+export default async function workflow(drovr: Drovr): Promise<void> {}
+`,
+        'utf8',
+      )
+      execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })
+
+      // Create worktree at derived path, lock it, then remove directory
+      const derivedPath = join(repo, '.worktrees', 'locked-item')
+      runGit(repo, ['worktree', 'add', '-b', 'drovr/locked-item', derivedPath, 'HEAD'])
+      runGit(repo, ['worktree', 'lock', '--reason', 'manual maintenance lock', derivedPath])
+      await rm(derivedPath, { recursive: true, force: true })
+
+      const excludePath = join(repo, '.git', 'info', 'exclude')
+      await mkdir(join(repo, '.git', 'info'), { recursive: true })
+      await writeFile(excludePath, '# initial exclude\n', 'utf8')
+
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+export default async function workflow(drovr: Drovr): Promise<void> {
+  await drovr.worktree({ name: 'locked-item' })
+}
+`,
+        'utf8',
+      )
+
+      expect(() =>
+        execFileSync('node', [drovr, 'start', '--resume'], { cwd: repo, stdio: 'pipe' }),
+      ).toThrow(/locked.*manual maintenance lock/i)
+
+      // Verify directory was NOT created, exclude was untouched, and registration is STILL locked
+      expect(existsSync(derivedPath)).toBe(false)
+      expect(await readFile(excludePath, 'utf8')).toBe('# initial exclude\n')
+      const rawList = runGit(repo, ['worktree', 'list', '--porcelain'])
+      expect(rawList).toContain('locked manual maintenance lock')
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('fails safely without mutation when duplicate or conflicting registrations exist for the same path', async () => {
+    const repo = await initRepo()
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+export default async function workflow(drovr: Drovr): Promise<void> {}
+`,
+        'utf8',
+      )
+      execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })
+
+      const derivedPath = join(repo, '.worktrees', 'dup-item')
+      runGit(repo, ['worktree', 'add', '-b', 'drovr/dup-item', derivedPath, 'HEAD'])
+      await rm(derivedPath, { recursive: true, force: true })
+
+      // Construct duplicate admin metadata registration pointing to the same worktree path
+      const gitWorktreesDir = join(repo, '.git', 'worktrees')
+      const dupDir = join(gitWorktreesDir, 'dup-item-alias')
+      await mkdir(dupDir, { recursive: true })
+      await writeFile(join(dupDir, 'gitdir'), join(derivedPath, '.git') + '\n', 'utf8')
+      await writeFile(join(dupDir, 'HEAD'), 'ref: refs/heads/drovr/dup-item\n', 'utf8')
+
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+export default async function workflow(drovr: Drovr): Promise<void> {
+  await drovr.worktree({ name: 'dup-item' })
+}
+`,
+        'utf8',
+      )
+
+      expect(() =>
+        execFileSync('node', [drovr, 'start', '--resume'], { cwd: repo, stdio: 'pipe' }),
+      ).toThrow(/multiple conflicting registrations/i)
+
+      // Verify nothing was created or deleted
+      expect(existsSync(derivedPath)).toBe(false)
+      expect(existsSync(dupDir)).toBe(true)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
 })

@@ -16,7 +16,6 @@ import {
   isGitCheckoutDirty,
   isGitWorktreeOfRepository,
   listGitWorktrees,
-  repairStaleWorktreeRegistration,
   resolveGitCommonDir,
   runGit,
   safeRealpath,
@@ -224,16 +223,17 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
         const pathExists = pathStat !== null
 
         const worktrees = listGitWorktrees(workingDir)
-        const otherOccupant = worktrees.find(
-          (w) => w.branch === fullBranchRef && safeRealpath(w.path) !== safeRealpath(worktreePath),
+        const matchingBranchEntries = worktrees.filter((w) => w.branch === fullBranchRef)
+        const branchElsewhere = matchingBranchEntries.filter(
+          (w) => safeRealpath(w.path) !== safeRealpath(worktreePath),
         )
-        if (otherOccupant) {
+        if (branchElsewhere.length > 0) {
           throw new Error(
-            `Cannot resume Worktree "${name}": branch "${branchName}" is already checked out at "${otherOccupant.path}".`,
+            `Cannot resume Worktree "${name}": branch "${branchName}" is already checked out at "${branchElsewhere[0].path}".`,
           )
         }
 
-        const pathRegistration = worktrees.find(
+        const matchingPathEntries = worktrees.filter(
           (w) => safeRealpath(w.path) === safeRealpath(worktreePath),
         )
 
@@ -272,13 +272,37 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
           )
         }
 
-        if (pathRegistration) {
-          if (pathRegistration.branch !== fullBranchRef) {
+        if (matchingPathEntries.length > 1) {
+          throw new Error(
+            `Cannot resume Worktree "${name}": multiple conflicting registrations found for path "${worktreePath}".`,
+          )
+        }
+
+        if (matchingPathEntries.length === 1) {
+          const reg = matchingPathEntries[0]
+          if (reg.branch !== fullBranchRef) {
             throw new Error(
-              `Cannot resume Worktree "${name}": stale registration at "${worktreePath}" is on branch "${pathRegistration.branch ?? 'detached HEAD'}", expected "${fullBranchRef}".`,
+              `Cannot resume Worktree "${name}": stale registration at "${worktreePath}" is on branch "${reg.branch ?? 'detached HEAD'}", expected "${fullBranchRef}".`,
             )
           }
-          repairStaleWorktreeRegistration(resolveGitCommonDir(workingDir), worktreePath)
+          if (reg.locked !== null) {
+            throw new Error(
+              `Cannot resume Worktree "${name}": Worktree registration at "${worktreePath}" is locked (${typeof reg.locked === 'string' ? reg.locked : 'locked'}).`,
+            )
+          }
+          if (reg.prunable === null) {
+            throw new Error(
+              `Cannot resume Worktree "${name}": Worktree registration at "${worktreePath}" is not prunable.`,
+            )
+          }
+
+          await ensureCloneLocalWorktreeExclusion(workingDir)
+          runGit(workingDir, ['worktree', 'add', '--force', worktreePath, branchName])
+
+          return Object.freeze({
+            name,
+            path: worktreePath,
+          })
         }
 
         await ensureCloneLocalWorktreeExclusion(workingDir)

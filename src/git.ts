@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process'
-import { readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs'
+import { realpathSync } from 'node:fs'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 
 export function runGit(cwd: string, args: string[]): string {
@@ -155,36 +155,6 @@ export function listGitWorktrees(cwd: string): GitWorktreeEntry[] {
     entries.push(current)
   }
   return entries
-}
-
-export function repairStaleWorktreeRegistration(gitCommonDir: string, worktreePath: string): void {
-  const worktreesDir = join(gitCommonDir, 'worktrees')
-  let entries: string[] = []
-  try {
-    entries = readdirSync(worktreesDir)
-  } catch {
-    return
-  }
-  const realTarget = safeRealpath(worktreePath)
-  const targetGitdir = join(worktreePath, '.git')
-  const realTargetGitdir = safeRealpath(targetGitdir)
-
-  for (const entry of entries) {
-    const entryDir = join(worktreesDir, entry)
-    const gitdirFile = join(entryDir, 'gitdir')
-    try {
-      const recorded = readFileSync(gitdirFile, 'utf8').trim()
-      const realRecorded = safeRealpath(recorded)
-      if (
-        recorded === targetGitdir ||
-        recorded === worktreePath ||
-        realRecorded === realTargetGitdir ||
-        realRecorded === realTarget
-      ) {
-        rmSync(entryDir, { recursive: true, force: true })
-      }
-    } catch {}
-  }
 }
 
 export function isGitWorktreeOfRepository(worktreePath: string, repositoryDir: string): boolean {
