@@ -17,9 +17,11 @@ import {
   isGitWorktreeOfRepository,
   listGitWorktrees,
   resolveGitCommonDir,
+  resolveGitWorktreeRoot,
   runGit,
   safeRealpath,
 } from './git'
+import { runWorktreeSetup } from './worktree-setup'
 import type { Drovr, Issue, Name, Worktree } from './index'
 import type { DrovrLogger, DrovrLoggerCounts } from './log'
 import { mergeExactLine } from './merge-line'
@@ -299,6 +301,11 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
 
           await ensureCloneLocalWorktreeExclusion(workingDir)
           runGit(workingDir, ['worktree', 'add', '--force', worktreePath, branchName])
+          await runWorktreeSetup({
+            worktreePath,
+            name,
+            startCheckout: resolveGitWorktreeRoot(workingDir),
+          })
 
           return Object.freeze({
             name,
@@ -308,6 +315,11 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
 
         await ensureCloneLocalWorktreeExclusion(workingDir)
         runGit(workingDir, ['worktree', 'add', worktreePath, branchName])
+        await runWorktreeSetup({
+          worktreePath,
+          name,
+          startCheckout: resolveGitWorktreeRoot(workingDir),
+        })
 
         return Object.freeze({
           name,
@@ -340,6 +352,11 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
       }
 
       runGit(workingDir, ['worktree', 'add', '-b', branchName, worktreePath, 'HEAD'])
+      await runWorktreeSetup({
+        worktreePath,
+        name,
+        startCheckout: resolveGitWorktreeRoot(workingDir),
+      })
 
       return Object.freeze({
         name,
