@@ -11,12 +11,15 @@ import {
   viewIssue,
 } from './gh'
 import {
-  getGitWorktreeBranch,
+  getGitWorktreeSymbolicRef,
   isGitBranchPresent,
   isGitCheckoutDirty,
   isGitWorktreeOfRepository,
+  listGitWorktrees,
+  repairStaleWorktreeRegistration,
   resolveGitCommonDir,
   runGit,
+  safeRealpath,
 } from './git'
 import type { Drovr, Issue, Name, Worktree } from './index'
 import type { DrovrLogger, DrovrLoggerCounts } from './log'
@@ -211,22 +214,50 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
 
       const name = opts.name
       const branchName = `drovr/${name}`
+      const fullBranchRef = `refs/heads/drovr/${name}`
       const worktreePath = join(workingDir, '.worktrees', name)
 
       if (mode === 'resume') {
-        const directoryExists = await entryExists(worktreePath)
-        const branchExists = isGitBranchPresent(workingDir, branchName)
+        const pathStat = await lstat(worktreePath).catch((err) =>
+          isEnoent(err) ? null : Promise.reject(err),
+        )
+        const pathExists = pathStat !== null
 
-        if (!directoryExists) {
-          if (!branchExists) {
+        const worktrees = listGitWorktrees(workingDir)
+        const otherOccupant = worktrees.find(
+          (w) => w.branch === fullBranchRef && safeRealpath(w.path) !== safeRealpath(worktreePath),
+        )
+        if (otherOccupant) {
+          throw new Error(
+            `Cannot resume Worktree "${name}": branch "${branchName}" is already checked out at "${otherOccupant.path}".`,
+          )
+        }
+
+        const pathRegistration = worktrees.find(
+          (w) => safeRealpath(w.path) === safeRealpath(worktreePath),
+        )
+
+        if (pathExists) {
+          if (!pathStat.isDirectory()) {
             throw new Error(
-              `Cannot resume Worktree "${name}": neither path "${worktreePath}" nor branch "${branchName}" exists.`,
+              `Cannot resume Worktree "${name}": path "${worktreePath}" is a foreign file or invalid directory.`,
+            )
+          }
+
+          if (!isGitWorktreeOfRepository(worktreePath, workingDir)) {
+            throw new Error(
+              `Cannot resume Worktree "${name}": path "${worktreePath}" is a foreign directory or not a Worktree of this repository.`,
+            )
+          }
+
+          const currentRef = getGitWorktreeSymbolicRef(worktreePath)
+          if (currentRef !== fullBranchRef) {
+            throw new Error(
+              `Cannot resume Worktree "${name}": Worktree at "${worktreePath}" is on branch "${currentRef ?? 'detached HEAD'}", expected "${fullBranchRef}".`,
             )
           }
 
           await ensureCloneLocalWorktreeExclusion(workingDir)
-          runGit(workingDir, ['worktree', 'prune'])
-          runGit(workingDir, ['worktree', 'add', worktreePath, branchName])
 
           return Object.freeze({
             name,
@@ -234,27 +265,24 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
           })
         }
 
-        const stat = await lstat(worktreePath).catch(() => null)
-        if (!stat || !stat.isDirectory()) {
+        const branchExists = isGitBranchPresent(workingDir, branchName)
+        if (!branchExists) {
           throw new Error(
-            `Cannot resume Worktree "${name}": path "${worktreePath}" is a foreign file or invalid directory.`,
+            `Cannot resume Worktree "${name}": neither path "${worktreePath}" nor branch "${branchName}" exists.`,
           )
         }
 
-        if (!isGitWorktreeOfRepository(worktreePath, workingDir)) {
-          throw new Error(
-            `Cannot resume Worktree "${name}": path "${worktreePath}" is a foreign directory or not a Worktree of this repository.`,
-          )
-        }
-
-        const currentBranch = getGitWorktreeBranch(worktreePath)
-        if (currentBranch !== branchName) {
-          throw new Error(
-            `Cannot resume Worktree "${name}": Worktree at "${worktreePath}" is on branch "${currentBranch ?? 'detached HEAD'}", expected "${branchName}".`,
-          )
+        if (pathRegistration) {
+          if (pathRegistration.branch !== fullBranchRef) {
+            throw new Error(
+              `Cannot resume Worktree "${name}": stale registration at "${worktreePath}" is on branch "${pathRegistration.branch ?? 'detached HEAD'}", expected "${fullBranchRef}".`,
+            )
+          }
+          repairStaleWorktreeRegistration(resolveGitCommonDir(workingDir), worktreePath)
         }
 
         await ensureCloneLocalWorktreeExclusion(workingDir)
+        runGit(workingDir, ['worktree', 'add', worktreePath, branchName])
 
         return Object.freeze({
           name,

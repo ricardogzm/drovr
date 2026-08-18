@@ -1047,4 +1047,183 @@ export default async function workflow(drovr: Drovr): Promise<void> {
       await rm(repo, { recursive: true, force: true })
     }
   })
+
+  it('reconnects matching Worktree when a colliding tag shares the same name and shorthand', async () => {
+    const repo = await initRepo()
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+
+export default async function workflow(drovr: Drovr): Promise<void> {
+  const wt = await drovr.worktree({ name: 'colliding-tag' })
+  const { writeFile } = await import('node:fs/promises')
+  const { join } = await import('node:path')
+  await writeFile(join(wt.path, 'tag-test.txt'), 'tag-ok\\n', 'utf8')
+}
+`,
+        'utf8',
+      )
+
+      // Pass 1: fresh start creates worktree and branch drovr/colliding-tag
+      execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })
+
+      // Create a colliding tag with the same name
+      runGit(repo, ['tag', 'drovr/colliding-tag', 'HEAD'])
+
+      // Pass 2: resume should successfully reconnect using full symbolic ref
+      execFileSync('node', [drovr, 'start', '--resume'], { cwd: repo, stdio: 'pipe' })
+
+      const worktreePath = join(repo, '.worktrees', 'colliding-tag')
+      expect(existsSync(join(worktreePath, 'tag-test.txt'))).toBe(true)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves unrelated stale registrations when selectively repairing a matching missing worktree', async () => {
+    const repo = await initRepo()
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+
+      // Create target worktree and an unrelated worktree
+      const targetPath = join(repo, '.worktrees', 'target-item')
+      const unrelatedPath = join(repo, '.worktrees', 'unrelated-offline')
+      runGit(repo, ['worktree', 'add', '-b', 'drovr/target-item', targetPath, 'HEAD'])
+      runGit(repo, ['worktree', 'add', '-b', 'drovr/unrelated-offline', unrelatedPath, 'HEAD'])
+
+      // Delete both worktree directories to make both registrations stale
+      await rm(targetPath, { recursive: true, force: true })
+      await rm(unrelatedPath, { recursive: true, force: true })
+
+      // Initialize starter workflow
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+export default async function workflow(drovr: Drovr): Promise<void> {}
+`,
+        'utf8',
+      )
+      execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })
+
+      // Resume workflow requesting ONLY target-item
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+export default async function workflow(drovr: Drovr): Promise<void> {
+  const wt = await drovr.worktree({ name: 'target-item' })
+  const { writeFile } = await import('node:fs/promises')
+  const { join } = await import('node:path')
+  await writeFile(join(wt.path, 'recreated.txt'), 'recreated\\n', 'utf8')
+}
+`,
+        'utf8',
+      )
+
+      execFileSync('node', [drovr, 'start', '--resume'], { cwd: repo, stdio: 'pipe' })
+
+      expect(existsSync(join(targetPath, 'recreated.txt'))).toBe(true)
+
+      // Verify that unrelated-offline stale registration was NOT pruned or deleted
+      const rawList = runGit(repo, ['worktree', 'list', '--porcelain'])
+      expect(rawList).toContain('unrelated-offline')
+      expect(rawList).toContain('prunable')
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('fails safely without mutation when the derived branch is checked out in another worktree', async () => {
+    const repo = await initRepo()
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+export default async function workflow(drovr: Drovr): Promise<void> {}
+`,
+        'utf8',
+      )
+      execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })
+
+      // Check out branch drovr/occupied-item in an external directory
+      const externalDir = await mkdtemp(join(tmpdir(), 'drovr-occupied-'))
+      runGit(repo, ['worktree', 'add', '-b', 'drovr/occupied-item', externalDir, 'HEAD'])
+
+      const excludePath = join(repo, '.git', 'info', 'exclude')
+      await mkdir(join(repo, '.git', 'info'), { recursive: true })
+      await writeFile(excludePath, '# initial exclude\n', 'utf8')
+
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+export default async function workflow(drovr: Drovr): Promise<void> {
+  await drovr.worktree({ name: 'occupied-item' })
+}
+`,
+        'utf8',
+      )
+
+      expect(() =>
+        execFileSync('node', [drovr, 'start', '--resume'], { cwd: repo, stdio: 'pipe' }),
+      ).toThrow(/already checked out/i)
+
+      // Derived path was NOT created, and exclude was NOT mutated
+      expect(existsSync(join(repo, '.worktrees', 'occupied-item'))).toBe(false)
+      expect(await readFile(excludePath, 'utf8')).toBe('# initial exclude\n')
+
+      await rm(externalDir, { recursive: true, force: true })
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('fails safely without mutation when a stale registration at the derived path is on the wrong branch', async () => {
+    const repo = await initRepo()
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+export default async function workflow(drovr: Drovr): Promise<void> {}
+`,
+        'utf8',
+      )
+      execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })
+
+      // Create worktree at derived path on a different branch, then delete directory leaving stale metadata
+      const derivedPath = join(repo, '.worktrees', 'stale-wrong')
+      runGit(repo, ['worktree', 'add', '-b', 'feature/other-branch', derivedPath, 'HEAD'])
+      // Create branch drovr/stale-wrong
+      runGit(repo, ['branch', 'drovr/stale-wrong'])
+      await rm(derivedPath, { recursive: true, force: true })
+
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+export default async function workflow(drovr: Drovr): Promise<void> {
+  await drovr.worktree({ name: 'stale-wrong' })
+}
+`,
+        'utf8',
+      )
+
+      expect(() =>
+        execFileSync('node', [drovr, 'start', '--resume'], { cwd: repo, stdio: 'pipe' }),
+      ).toThrow(/stale registration.*expected/i)
+
+      // Verify stale metadata for feature/other-branch was NOT removed or overwritten
+      const rawList = runGit(repo, ['worktree', 'list', '--porcelain'])
+      expect(rawList).toContain('stale-wrong')
+      expect(rawList).toContain('feature/other-branch')
+      expect(existsSync(derivedPath)).toBe(false)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
 })
