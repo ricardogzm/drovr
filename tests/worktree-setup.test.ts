@@ -33,7 +33,44 @@ beforeAll(() => {
   execFileSync('pnpm', ['run', 'build'], { cwd: root, stdio: 'inherit' })
 })
 
-async function lockDatabase(dbPath: string): Promise<{ release: () => Promise<void> }> {
+async function terminateProcess(child: ChildProcess): Promise<void> {
+  if (child.exitCode === null && child.signalCode === null && child.pid) {
+    const exited = new Promise<void>((resolve) => child.on('exit', () => resolve()))
+    try {
+      process.kill(-child.pid, 'SIGKILL')
+    } catch {}
+    await exited
+  }
+}
+
+async function waitForReadiness(
+  check: () => boolean,
+  options: {
+    child?: ChildProcess
+    timeoutMs?: number
+    description: string
+  },
+): Promise<void> {
+  const { child, timeoutMs = 5000, description } = options
+  const startTime = Date.now()
+
+  while (!check()) {
+    if (child && (child.exitCode !== null || child.signalCode !== null)) {
+      throw new Error(
+        `Process exited prematurely with code ${child.exitCode} (signal ${child.signalCode}) while waiting for ${description}`,
+      )
+    }
+    if (Date.now() - startTime >= timeoutMs) {
+      throw new Error(`Timed out after ${timeoutMs}ms waiting for ${description}`)
+    }
+    await new Promise((r) => setTimeout(r, 20))
+  }
+}
+
+async function lockDatabase(
+  dbPath: string,
+  timeoutMs = 5000,
+): Promise<{ release: () => Promise<void> }> {
   const locker = spawn(
     'node',
     [
@@ -56,48 +93,37 @@ async function lockDatabase(dbPath: string): Promise<{ release: () => Promise<vo
     { detached: true, stdio: ['pipe', 'pipe', 'inherit'] },
   )
 
-  await new Promise<void>((resolve, reject) => {
-    locker.stdout.on('data', (chunk: Buffer) => {
-      if (chunk.toString().includes('LOCKED')) {
-        resolve()
-      }
-    })
-    locker.on('error', reject)
-    locker.on('exit', (code) => {
-      if (code !== 0) {
-        reject(new Error(`Database locker exited with code ${code}`))
-      }
-    })
+  let locked = false
+  locker.stdout.on('data', (chunk: Buffer) => {
+    if (chunk.toString().includes('LOCKED')) {
+      locked = true
+    }
   })
 
-  return {
-    async release() {
-      if (locker.exitCode === null) {
-        try {
-          locker.stdin.write('RELEASE\n')
-        } catch {}
-        const exited = new Promise<void>((resolve) => locker.on('exit', () => resolve()))
-        const timeout = new Promise<void>((resolve) => setTimeout(resolve, 500))
-        await Promise.race([exited, timeout])
-        if (locker.exitCode === null && locker.pid) {
-          try {
-            process.kill(-locker.pid, 'SIGKILL')
-          } catch {}
-          await exited
-        }
-      }
-    },
+  const release = async () => {
+    if (locker.exitCode === null && locker.signalCode === null) {
+      try {
+        locker.stdin.write('RELEASE\n')
+      } catch {}
+      const exited = new Promise<void>((resolve) => locker.on('exit', () => resolve()))
+      const timeout = new Promise<void>((resolve) => setTimeout(resolve, 500))
+      await Promise.race([exited, timeout])
+      await terminateProcess(locker)
+    }
   }
-}
 
-async function terminateProcess(child: ChildProcess): Promise<void> {
-  if (child.exitCode === null && child.signalCode === null && child.pid) {
-    const exited = new Promise<void>((resolve) => child.on('exit', () => resolve()))
-    try {
-      process.kill(-child.pid, 'SIGKILL')
-    } catch {}
-    await exited
+  try {
+    await waitForReadiness(() => locked, {
+      child: locker,
+      timeoutMs,
+      description: `database lock on ${dbPath}`,
+    })
+  } catch (error) {
+    await release()
+    throw error
   }
+
+  return { release }
 }
 
 describe('Issue #28: Worktree setup gates readiness', () => {
@@ -1251,9 +1277,11 @@ export default async function workflow(drovr: Drovr): Promise<void> {
 
       try {
         // Wait until mid-setup marker file is touched
-        while (!existsSync(join(syncDir, 'mid_setup'))) {
-          await new Promise((r) => setTimeout(r, 20))
-        }
+        await waitForReadiness(() => existsSync(join(syncDir, 'mid_setup')), {
+          child,
+          timeoutMs: 5000,
+          description: 'mid-setup marker file',
+        })
 
         // Terminate the Drovr process group itself while setup is in flight
         await terminateProcess(child)
@@ -1333,9 +1361,11 @@ export default async function workflow(drovr: Drovr): Promise<void> {
 
       try {
         // Wait until setup commands have completed
-        while (!existsSync(join(syncDir, 'commands_succeeded'))) {
-          await new Promise((r) => setTimeout(r, 20))
-        }
+        await waitForReadiness(() => existsSync(join(syncDir, 'commands_succeeded')), {
+          child,
+          timeoutMs: 5000,
+          description: 'commands succeeded marker file',
+        })
 
         // Hold exclusive lock on project database so the completion write fails
         const lock = await lockDatabase(join(repo, '.drovr', 'state.sqlite'))
@@ -1348,8 +1378,11 @@ export default async function workflow(drovr: Drovr): Promise<void> {
           child.stderr.on('data', (d: Buffer) => {
             stderr += d.toString()
           })
-          const exitCode = await new Promise<number | null>((resolve) => child.on('exit', resolve))
-          expect(exitCode).not.toBe(0)
+          await waitForReadiness(() => child.exitCode !== null || child.signalCode !== null, {
+            timeoutMs: 15000,
+            description: 'Drovr exit on locked database write failure',
+          })
+          expect(child.exitCode).not.toBe(0)
           expect(stderr).toContain('database is locked')
         } finally {
           await lock.release()
