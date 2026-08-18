@@ -1,11 +1,21 @@
 import type { DatabaseSync } from 'node:sqlite'
-import type { Drovr, Name } from './index'
+import {
+  assignIssue,
+  getAuthenticatedUser,
+  getRepoFromStartCheckout,
+  listReadyIssues,
+  normalizeIssue,
+  viewIssue,
+} from './gh'
+import type { Drovr, Issue, Name } from './index'
 import type { DrovrLogger, DrovrLoggerCounts } from './log'
 
 export interface DrovrContext {
   db?: DatabaseSync
   logger?: DrovrLogger
   counts?: DrovrLoggerCounts
+  root?: string
+  cwd?: string
 }
 
 const NAME_REGEX = /^[a-z][a-z0-9_-]{0,31}$/
@@ -15,8 +25,8 @@ export function isValidName(name: unknown): name is Name {
 }
 
 export function createDrovr(context: DrovrContext = {}): Drovr {
-  const { db, logger, counts } = context
-
+  const { db, logger, counts, root, cwd } = context
+  const workingDir = root ?? cwd ?? process.cwd()
   return {
     async resource() {
       throw new Error('resource is not implemented yet')
@@ -183,11 +193,127 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
       throw new Error('start is not implemented yet')
     },
     issues: {
-      async list() {
-        throw new Error('issues.list is not implemented yet')
+      async list(opts?: { repo?: string }): Promise<readonly Issue[]> {
+        if (opts !== undefined && (typeof opts !== 'object' || opts === null)) {
+          throw new TypeError('issues.list options must be an object')
+        }
+        if (
+          opts?.repo !== undefined &&
+          (typeof opts.repo !== 'string' || !opts.repo.includes('/'))
+        ) {
+          throw new TypeError('issues.list opts.repo must be in owner/repo form')
+        }
+
+        const targetRepo = opts?.repo ?? getRepoFromStartCheckout(workingDir)
+        const rawIssues = listReadyIssues(workingDir, targetRepo)
+
+        let claimedRows: Array<{ issue_number: number; name: string }> = []
+        if (db) {
+          claimedRows = db
+            .prepare('SELECT issue_number, name FROM claims WHERE repo = ?')
+            .all(targetRepo) as Array<{ issue_number: number; name: string }>
+        }
+
+        const claimedNumbers = new Set(claimedRows.map((r) => r.issue_number))
+        const seenNumbers = new Set<number>()
+        const resultIssues: Issue[] = []
+
+        for (const raw of rawIssues) {
+          const num = Number(raw.number)
+          seenNumbers.add(num)
+          const assignees = Array.isArray(raw.assignees) ? raw.assignees : []
+          const isUnassigned = assignees.length === 0
+          const isClaimedLocally = claimedNumbers.has(num)
+
+          if (isUnassigned || isClaimedLocally) {
+            resultIssues.push(normalizeIssue(raw, targetRepo))
+          }
+        }
+
+        if (db) {
+          for (const claimed of claimedRows) {
+            if (!seenNumbers.has(claimed.issue_number)) {
+              const raw = viewIssue(workingDir, targetRepo, claimed.issue_number)
+              if (raw) {
+                if (raw.state === 'CLOSED') {
+                  db.prepare('DELETE FROM claims WHERE repo = ? AND issue_number = ?').run(
+                    targetRepo,
+                    claimed.issue_number,
+                  )
+                } else if (raw.state === 'OPEN') {
+                  const hasReadyLabel =
+                    Array.isArray(raw.labels) &&
+                    raw.labels.some(
+                      (l) => (typeof l === 'string' ? l : l?.name) === 'ready-for-agent',
+                    )
+                  if (hasReadyLabel) {
+                    resultIssues.push(normalizeIssue(raw, targetRepo))
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        return Object.freeze(resultIssues)
       },
-      async claim() {
-        throw new Error('issues.claim is not implemented yet')
+      async claim(issue: Issue, opts: { name: Name }): Promise<void> {
+        if (typeof issue !== 'object' || issue === null) {
+          throw new TypeError('claim issue must be an object')
+        }
+        if (typeof issue.repo !== 'string' || issue.repo.trim() === '') {
+          throw new TypeError('claim issue.repo must be a non-empty string')
+        }
+        if (
+          typeof issue.number !== 'number' ||
+          !Number.isInteger(issue.number) ||
+          issue.number < 1
+        ) {
+          throw new TypeError('claim issue.number must be a positive integer')
+        }
+        if (typeof opts !== 'object' || opts === null) {
+          throw new TypeError('claim options must be an object')
+        }
+        if (!isValidName(opts.name)) {
+          throw new TypeError(
+            `Invalid name: "${String(opts.name)}". Names must match [a-z][a-z0-9_-]{0,31}`,
+          )
+        }
+
+        if (db) {
+          const existing = db
+            .prepare('SELECT name FROM claims WHERE repo = ? AND issue_number = ?')
+            .get(issue.repo, issue.number) as { name: string } | undefined
+
+          if (existing !== undefined) {
+            if (existing.name !== opts.name) {
+              throw new Error(
+                `Issue #${issue.number} in ${issue.repo} is already claimed by ${existing.name}`,
+              )
+            }
+          } else {
+            try {
+              db.prepare('INSERT INTO claims (repo, issue_number, name) VALUES (?, ?, ?)').run(
+                issue.repo,
+                issue.number,
+                opts.name,
+              )
+            } catch (err) {
+              const raced = db
+                .prepare('SELECT name FROM claims WHERE repo = ? AND issue_number = ?')
+                .get(issue.repo, issue.number) as { name: string } | undefined
+              if (raced && raced.name !== opts.name) {
+                throw new Error(
+                  `Issue #${issue.number} in ${issue.repo} is already claimed by ${raced.name}`,
+                )
+              }
+              throw err
+            }
+          }
+        }
+
+        const user = getAuthenticatedUser(workingDir)
+        assignIssue(workingDir, issue.repo, issue.number, user)
       },
       async close() {
         throw new Error('issues.close is not implemented yet')
