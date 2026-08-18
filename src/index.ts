@@ -90,14 +90,16 @@ export type Drovr = {
   /**
    * Define a named Resource before leasing.
    *
-   * Capacity Resources require an integer capacity of at least one. Port Resources
-   * declare one port, a nonempty unique readonly list, or an inclusive range and
-   * have implicit capacity one. A spec cannot contain both `capacity` and `ports`.
+   * `name` must be a nonempty string; Drovr validates immediately. Capacity
+   * Resources require an integer capacity of at least one. Port Resources declare
+   * one port, a nonempty unique readonly list, or an inclusive range and have
+   * implicit capacity one. A spec cannot contain both `capacity` and `ports`.
    * Ports are integers from 1 through 65535; Drovr validates immediately and does
    * not repair malformed, duplicate, reversed, or mixed declarations. A Port
    * Resource reserves its entire normalized port set with cross-Resource exclusion
    * by numeric port; it does not allocate ports or guarantee operating-system
    * availability. Re-definition may not reduce capacity below live occupancy.
+   * Re-defining a live Port Resource with changed ports fails.
    */
   resource(
     name: string,
@@ -111,9 +113,12 @@ export type Drovr = {
   /**
    * Run `fn` for each item with bounded concurrency.
    *
+   * `opts.concurrency` must be a positive integer; Drovr validates immediately.
    * Validates every Name from `opts.name`, rejects duplicates, and skips Names
-   * already recorded as Completions before invoking callbacks. One failed item
-   * does not cancel other active or pending items.
+   * already recorded as Completions before invoking callbacks. A callback return
+   * records a Completion for that Name; a throw leaves it incomplete and the
+   * callback is replayed on resume. One failed item does not cancel other active
+   * or pending items.
    */
   map<T>(
     items: readonly T[],

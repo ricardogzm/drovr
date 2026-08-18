@@ -36,6 +36,17 @@ describe('published declarations', () => {
     expect(source).toContain('from: number')
     expect(source).toContain('to: number')
     expect(source).toContain('reserves its entire normalized port set')
+    expect(source).toContain('`name` must be a nonempty string')
+    expect(source).toContain('Re-defining a live Port Resource with changed ports fails')
+  })
+
+  it('documents map concurrency validation and Completion semantics', () => {
+    const source = readFileSync(join(root, 'dist/index.d.mts'), 'utf8')
+
+    expect(source).toContain('`opts.concurrency` must be a positive integer')
+    expect(source).toContain('records a Completion for that Name')
+    expect(source).toContain('a throw leaves it incomplete and the')
+    expect(source).toContain('callback is replayed on resume')
   })
 
   it('publishes only the root and package metadata subpaths', () => {
