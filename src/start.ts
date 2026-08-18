@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { openProjectDatabase } from './db'
 import { createDrovr } from './drovr'
-import { resolveGitWorktreeRoot } from './git'
+import { isBeneathManagedWorktrees, resolveGitWorktreeRoot } from './git'
 import { acquireCheckoutLock } from './lock'
 import { createDrovrLogger } from './log'
 import type { DrovrLoggerCounts } from './log'
@@ -22,6 +22,9 @@ export interface StartOptions {
 export async function runStart(cwd: string, options: StartOptions = {}): Promise<void> {
   const mode = options.resume ? 'resume' : 'fresh'
   const root = resolveGitWorktreeRoot(cwd, 'drovr start')
+  if (isBeneathManagedWorktrees(cwd, root)) {
+    throw new Error("drovr start cannot run from beneath this repository's managed .worktrees area")
+  }
   const drovrDir = join(root, '.drovr')
   await mkdir(drovrDir, { recursive: true })
 

@@ -1,3 +1,5 @@
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
 import {
   assignIssue,
@@ -8,8 +10,10 @@ import {
   normalizeIssue,
   viewIssue,
 } from './gh'
-import type { Drovr, Issue, Name } from './index'
+import { isGitBranchPresent, isGitCheckoutDirty, resolveGitCommonDir, runGit } from './git'
+import type { Drovr, Issue, Name, Worktree } from './index'
 import type { DrovrLogger, DrovrLoggerCounts } from './log'
+import { mergeExactLine } from './merge-line'
 
 export interface DrovrContext {
   db?: DatabaseSync
@@ -187,8 +191,51 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
         throw new Error(`${itemErrors.length} map items failed: ${errorNames}`)
       }
     },
-    async worktree() {
-      throw new Error('worktree is not implemented yet')
+    async worktree(opts: { name: Name }): Promise<Worktree> {
+      if (typeof opts !== 'object' || opts === null) {
+        throw new TypeError('worktree options must be an object')
+      }
+      if (!isValidName(opts.name)) {
+        throw new TypeError(
+          `Invalid name: "${String(opts.name)}". Names must match [a-z][a-z0-9_-]{0,31}`,
+        )
+      }
+
+      const name = opts.name
+      const branchName = `drovr/${name}`
+      const worktreePath = join(workingDir, '.worktrees', name)
+
+      const branchExists = isGitBranchPresent(workingDir, branchName)
+      const directoryExists = await pathExists(worktreePath)
+
+      if (branchExists || directoryExists) {
+        if (branchExists && directoryExists) {
+          throw new Error(
+            `Worktree branch "${branchName}" and path "${worktreePath}" already exist. Run drovr start --resume to reconnect.`,
+          )
+        }
+        if (branchExists) {
+          throw new Error(
+            `Worktree branch "${branchName}" already exists. Run drovr start --resume to reconnect.`,
+          )
+        }
+        throw new Error(
+          `Worktree path "${worktreePath}" already exists. Run drovr start --resume to reconnect.`,
+        )
+      }
+
+      await ensureCloneLocalWorktreeExclusion(workingDir)
+
+      if (isGitCheckoutDirty(workingDir)) {
+        process.stderr.write('Warning: Start checkout has uncommitted changes\n')
+      }
+
+      runGit(workingDir, ['worktree', 'add', '-b', branchName, worktreePath, 'HEAD'])
+
+      return Object.freeze({
+        name,
+        path: worktreePath,
+      })
     },
     async start() {
       throw new Error('start is not implemented yet')
@@ -386,4 +433,42 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
       },
     },
   }
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await stat(path)
+    return true
+  } catch (error) {
+    if (isEnoent(error)) {
+      return false
+    }
+    throw error
+  }
+}
+
+async function readTextIfExists(path: string): Promise<string> {
+  try {
+    return await readFile(path, 'utf8')
+  } catch (error) {
+    if (isEnoent(error)) {
+      return ''
+    }
+    throw error
+  }
+}
+
+async function ensureCloneLocalWorktreeExclusion(workingDir: string): Promise<void> {
+  const gitCommonDir = resolveGitCommonDir(workingDir)
+  const excludePath = join(gitCommonDir, 'info', 'exclude')
+  await mkdir(join(gitCommonDir, 'info'), { recursive: true })
+  const exclude = await readTextIfExists(excludePath)
+  const merged = mergeExactLine(exclude, '/.worktrees/')
+  if (merged !== exclude) {
+    await writeFile(excludePath, merged, 'utf8')
+  }
+}
+
+function isEnoent(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT'
 }
