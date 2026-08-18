@@ -39,30 +39,44 @@ function extractExecError(err: unknown): { status?: number; stderr: string } {
 
 interface MockHerdrWorkspace {
   workspace_id: string
-  cwd: string
+  number: number
   label?: string
   focused: boolean
   pane_count: number
   tab_count: number
   active_tab_id: string
   agent_status: string
-  root_pane: { pane_id: string }
-  tab: { tab_id: string }
 }
 
 interface MockHerdrAgent {
-  name: string
-  kind: string
-  pane_id: string
+  terminal_id: string
+  agent_status: string
   workspace_id: string
   tab_id: string
-  agent_status: string
+  pane_id: string
+  focused: boolean
+  revision: number
+  name: string
+  agent: string
+  display_agent: string
   cwd: string
-  argv: string[]
+  foreground_cwd: string
+}
+
+interface MockHerdrPane {
+  pane_id: string
+  terminal_id: string
+  workspace_id: string
+  tab_id: string
+  focused: boolean
+  agent_status: string
+  revision: number
+  cwd: string
 }
 
 interface MockHerdrState {
   workspaces?: MockHerdrWorkspace[]
+  panes?: MockHerdrPane[]
   agents?: MockHerdrAgent[]
   failNextWorkspaceCreate?: boolean | string
   failNextAgentStart?: boolean | string
@@ -79,6 +93,7 @@ async function setupMockHerdr(
   const statePath = join(dir, 'mock-herdr-state.json')
   const defaultState: MockHerdrState = {
     workspaces: [],
+    panes: [],
     agents: [],
     nextWorkspaceNum: 1,
     ...initialState,
@@ -96,6 +111,7 @@ if (!statePath || !fs.existsSync(statePath)) {
 
 const state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
 if (!state.workspaces) state.workspaces = []
+if (!state.panes) state.panes = []
 if (!state.agents) state.agents = []
 if (!state.nextWorkspaceNum) state.nextWorkspaceNum = 1
 
@@ -147,39 +163,51 @@ if (args[0] === 'workspace' && args[1] === 'create') {
   const wsId = 'w' + num
   const tabId = wsId + ':t1'
   const paneId = wsId + ':p1'
+  const termId = 'term-' + num
 
   const ws = {
     workspace_id: wsId,
-    cwd,
+    number: num,
     label,
     focused,
     pane_count: 1,
     tab_count: 1,
     active_tab_id: tabId,
+    agent_status: 'unknown'
+  }
+
+  const tab = {
+    tab_id: tabId,
+    workspace_id: wsId,
+    number: 1,
+    label: 'tab 1',
+    focused: true,
+    pane_count: 1,
+    agent_status: 'unknown'
+  }
+
+  const rootPane = {
+    pane_id: paneId,
+    terminal_id: termId,
+    workspace_id: wsId,
+    tab_id: tabId,
+    focused: true,
     agent_status: 'unknown',
-    root_pane: { pane_id: paneId },
-    tab: { tab_id: tabId }
+    revision: 0,
+    cwd
   }
 
   state.workspaces.push(ws)
+  state.panes.push(rootPane)
   saveState()
 
   console.log(JSON.stringify({
     id: 'req-' + num,
     result: {
       type: 'workspace_created',
-      workspace: {
-        workspace_id: wsId,
-        cwd,
-        label,
-        focused
-      },
-      tab: {
-        tab_id: tabId
-      },
-      root_pane: {
-        pane_id: paneId
-      }
+      workspace: ws,
+      tab: tab,
+      root_pane: rootPane
     }
   }))
   process.exit(0)
@@ -197,7 +225,8 @@ if (args[0] === 'workspace' && args[1] === 'close') {
   if (idx !== -1) {
     state.workspaces.splice(idx, 1)
   }
-  // Also clean up agents in that workspace
+  // Also clean up panes and agents in that workspace
+  state.panes = state.panes.filter((p) => p.workspace_id !== wsId)
   state.agents = state.agents.filter((a) => a.workspace_id !== wsId)
 
   saveState()
@@ -288,17 +317,21 @@ if (args[0] === 'agent' && args[1] === 'start') {
     }
   }
 
-  const ws = state.workspaces.find((w) => w.root_pane && w.root_pane.pane_id === paneId)
+  const pane = state.panes.find((p) => p.pane_id === paneId)
 
   const agentRecord = {
-    name,
-    kind,
-    pane_id: paneId,
-    workspace_id: ws ? ws.workspace_id : 'unknown',
-    tab_id: ws ? ws.active_tab_id : 'unknown',
+    terminal_id: pane ? pane.terminal_id : 'term-' + paneId,
     agent_status: 'idle',
-    cwd: ws ? ws.cwd : process.cwd(),
-    argv: ompArgs
+    workspace_id: pane ? pane.workspace_id : 'unknown',
+    tab_id: pane ? pane.tab_id : 'unknown',
+    pane_id: paneId,
+    focused: false,
+    revision: 1,
+    name,
+    agent: kind,
+    display_agent: kind.toUpperCase(),
+    cwd: pane ? pane.cwd : process.cwd(),
+    foreground_cwd: pane ? pane.cwd : process.cwd()
   }
 
   state.agents.push(agentRecord)
@@ -447,22 +480,24 @@ export default async function (drovr: Drovr) {
     const workspaces = listHerdrWorkspaces(binDir, statePath)
     expect(workspaces).toHaveLength(1)
     const ws = workspaces[0]
-    expect(ws.cwd).toBe(join(dir, '.worktrees/worker-a'))
     expect(ws.label).toBe('worker-a')
     expect(ws.focused).toBe(false)
+    expect(ws.pane_count).toBe(1)
 
     const agents = listHerdrAgents(binDir, statePath)
     expect(agents).toHaveLength(1)
     const agent = agents[0]
     expect(agent.name).toBe('worker-a')
-    expect(agent.kind).toBe('omp')
-    expect(agent.pane_id).toBe(ws.root_pane.pane_id)
+    expect(agent.agent).toBe('omp')
     expect(agent.workspace_id).toBe(ws.workspace_id)
-    expect(agent.argv).toEqual([])
+    expect(agent.cwd).toBe(join(dir, '.worktrees/worker-a'))
+    expect(agent.agent_status).toBe('idle')
 
     const singleAgent = getHerdrAgent(binDir, statePath, 'worker-a')
     expect(singleAgent).toBeDefined()
     expect(singleAgent?.name).toBe('worker-a')
+    expect(singleAgent?.agent).toBe('omp')
+    expect(singleAgent?.cwd).toBe(join(dir, '.worktrees/worker-a'))
 
     await rm(dir, { recursive: true, force: true })
   })
@@ -579,7 +614,7 @@ export default async function (drovr: Drovr) {
     expect(errInfo.status).toBe(1)
     expect(errInfo.stderr).toContain('Simulated OMP startup crash')
 
-    // item-a succeeded: its workspace and agent remain
+    // item-a succeeded: its workspace and agent remain in Herdr
     const workspaces = listHerdrWorkspaces(binDir, statePath)
     expect(workspaces).toHaveLength(1)
     expect(workspaces[0].label).toBe('item-a')
@@ -587,6 +622,7 @@ export default async function (drovr: Drovr) {
     const agents = listHerdrAgents(binDir, statePath)
     expect(agents).toHaveLength(1)
     expect(agents[0].name).toBe('item-a')
+    expect(agents[0].cwd).toBe(join(dir, '.worktrees/item-a'))
 
     // item-b's agent does not exist and its attempt-created workspace was closed
     expect(getHerdrAgent(binDir, statePath, 'item-b')).toBeNull()
@@ -646,6 +682,7 @@ export default async function (drovr: Drovr) {
     const agents = listHerdrAgents(binDir, statePath)
     expect(agents).toHaveLength(1)
     expect(agents[0].name).toBe('same-name')
+    expect(agents[0].cwd).toBe(join(dir, '.worktrees/same-name'))
 
     await rm(dir, { recursive: true, force: true })
   })
@@ -686,6 +723,7 @@ export default async function (drovr: Drovr) {
     const agents = listHerdrAgents(binDir, statePath)
     expect(agents).toHaveLength(1)
     expect(agents[0].name).toBe('surviving-worker')
+    expect(agents[0].cwd).toBe(join(dir, '.worktrees/surviving-worker'))
 
     await rm(dir, { recursive: true, force: true })
   })
@@ -740,9 +778,9 @@ export default async function (drovr: Drovr) {
     for (const agent of agents) {
       const matchingWs = workspaces.find((w) => w.label === agent.name)
       expect(matchingWs).toBeDefined()
-      expect(agent.pane_id).toBe(matchingWs!.root_pane.pane_id)
+      expect(agent.workspace_id).toBe(matchingWs!.workspace_id)
       expect(agent.cwd).toBe(join(dir, '.worktrees', agent.name))
-      expect(agent.argv).toEqual([])
+      expect(agent.agent).toBe('omp')
     }
 
     await rm(dir, { recursive: true, force: true })
