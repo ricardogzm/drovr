@@ -41,6 +41,7 @@ interface MockGhState {
     [key: string]: unknown
   }>
   failNextEdit?: boolean
+  failNextClose?: boolean
 }
 
 async function setupMockGh(
@@ -150,6 +151,26 @@ if (args[0] === 'issue' && args[1] === 'edit') {
       issue.assignees = assignees
     }
   }
+  fs.writeFileSync(statePath, JSON.stringify(state, null, 2), 'utf8')
+  process.exit(0)
+}
+
+// Command: gh issue close <number>
+if (args[0] === 'issue' && args[1] === 'close') {
+  if (state.failNextClose) {
+    state.failNextClose = false
+    fs.writeFileSync(statePath, JSON.stringify(state, null, 2), 'utf8')
+    console.error('Simulated GitHub API close error')
+    process.exit(1)
+  }
+  const num = parseInt(args[2], 10)
+  const targetRepo = getRepoArg()
+  const issue = (state.issues || []).find((i) => i.repo === targetRepo && i.number === num)
+  if (!issue) {
+    console.error('issue not found for close: #' + num)
+    process.exit(1)
+  }
+  issue.state = 'CLOSED'
   fs.writeFileSync(statePath, JSON.stringify(state, null, 2), 'utf8')
   process.exit(0)
 }
@@ -987,6 +1008,606 @@ describe('Drovr.issues.claim', () => {
           stdio: 'pipe',
         }),
       ).toThrow(/Names must match/)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('Drovr.issues.close', () => {
+  it('fails before GitHub mutation when the Issue has no local Claim', async () => {
+    const repo = await initRepo()
+    try {
+      const { binDir, statePath } = await setupMockGh(repo, {
+        defaultRepo: 'acme/widget',
+        currentUser: 'drovr-bot',
+        issues: [
+          {
+            repo: 'acme/widget',
+            number: 801,
+            title: 'Unclaimed close attempt',
+            body: 'Body 801',
+            url: 'https://github.com/acme/widget/issues/801',
+            state: 'OPEN',
+            labels: [{ name: 'ready-for-agent' }],
+            assignees: [],
+            author: { login: 'alice' },
+            createdAt: '2026-08-18T00:00:00Z',
+            updatedAt: '2026-08-18T01:00:00Z',
+          },
+        ],
+      })
+
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `export default async function (drovr) {
+  const issues = await drovr.issues.list()
+  await drovr.issues.close(issues[0])
+}
+`,
+        'utf8',
+      )
+
+      expect(() =>
+        execFileSync('node', [drovr, 'start'], {
+          cwd: repo,
+          env: {
+            ...process.env,
+            PATH: `${binDir}:${process.env.PATH}`,
+            GH_STATE_FILE: statePath,
+          },
+          stdio: 'pipe',
+        }),
+      ).toThrow(/no local Claim exists/)
+
+      // Confirm GitHub issue was NOT mutated and remains OPEN
+      const ghState = JSON.parse(await readFile(statePath, 'utf8'))
+      expect(ghState.issues[0].state).toBe('OPEN')
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('confirms the GitHub Issue is closed before deleting the Claim and retains assignee and readiness label', async () => {
+    const repo = await initRepo()
+    try {
+      const { binDir, statePath } = await setupMockGh(repo, {
+        defaultRepo: 'acme/widget',
+        currentUser: 'drovr-bot',
+        issues: [
+          {
+            repo: 'acme/widget',
+            number: 802,
+            title: 'Claim and close issue',
+            body: 'Body 802',
+            url: 'https://github.com/acme/widget/issues/802',
+            state: 'OPEN',
+            labels: [{ name: 'ready-for-agent' }, { name: 'feature' }],
+            assignees: [],
+            author: { login: 'alice' },
+            createdAt: '2026-08-18T00:00:00Z',
+            updatedAt: '2026-08-18T01:00:00Z',
+          },
+        ],
+      })
+
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      // Claim and close in workflow
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `export default async function (drovr) {
+  const issues = await drovr.issues.list()
+  await drovr.issues.claim(issues[0], { name: 'worker-closer' })
+  await drovr.issues.close(issues[0])
+}
+`,
+        'utf8',
+      )
+
+      execFileSync('node', [drovr, 'start'], {
+        cwd: repo,
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          GH_STATE_FILE: statePath,
+        },
+      })
+
+      const ghState = JSON.parse(await readFile(statePath, 'utf8'))
+      const issue = ghState.issues[0]
+      // Confirmed closed on GitHub
+      expect(issue.state).toBe('CLOSED')
+      // Retains assignee and readiness label
+      expect(issue.assignees).toEqual([{ login: 'drovr-bot' }])
+      const labelNames = issue.labels.map((l: string | { name: string }) =>
+        typeof l === 'string' ? l : l.name,
+      )
+      expect(labelNames).toContain('ready-for-agent')
+      expect(labelNames).toContain('feature')
+
+      // Second run trying to close again should fail because local claim was deleted
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `export default async function (drovr) {
+  const issue = {
+    repo: 'acme/widget',
+    number: 802,
+    title: 'Claim and close issue',
+    body: 'Body 802',
+    url: 'https://github.com/acme/widget/issues/802',
+    state: 'CLOSED',
+    labels: ['ready-for-agent', 'feature'],
+    assignees: ['drovr-bot'],
+    author: 'alice',
+    createdAt: '2026-08-18T00:00:00Z',
+    updatedAt: '2026-08-18T01:00:00Z',
+  }
+  await drovr.issues.close(issue)
+}
+`,
+        'utf8',
+      )
+
+      expect(() =>
+        execFileSync('node', [drovr, 'start'], {
+          cwd: repo,
+          env: {
+            ...process.env,
+            PATH: `${binDir}:${process.env.PATH}`,
+            GH_STATE_FILE: statePath,
+          },
+          stdio: 'pipe',
+        }),
+      ).toThrow(/no local Claim exists/)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('closes idempotently when GitHub Issue is already closed but has a surviving Claim', async () => {
+    const repo = await initRepo()
+    try {
+      const { binDir, statePath } = await setupMockGh(repo, {
+        defaultRepo: 'acme/widget',
+        currentUser: 'drovr-bot',
+        issues: [
+          {
+            repo: 'acme/widget',
+            number: 803,
+            title: 'Already closed GitHub issue',
+            body: 'Body 803',
+            url: 'https://github.com/acme/widget/issues/803',
+            state: 'OPEN',
+            labels: [{ name: 'ready-for-agent' }],
+            assignees: [],
+            author: { login: 'alice' },
+            createdAt: '2026-08-18T00:00:00Z',
+            updatedAt: '2026-08-18T01:00:00Z',
+          },
+        ],
+      })
+
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      // Claim the issue
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `export default async function (drovr) {
+  const issues = await drovr.issues.list()
+  await drovr.issues.claim(issues[0], { name: 'worker-idempotent' })
+}
+`,
+        'utf8',
+      )
+
+      execFileSync('node', [drovr, 'start'], {
+        cwd: repo,
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          GH_STATE_FILE: statePath,
+        },
+      })
+
+      // GitHub issue is closed out-of-band, but local claim still survives
+      const ghState = JSON.parse(await readFile(statePath, 'utf8'))
+      ghState.issues[0].state = 'CLOSED'
+      await writeFile(statePath, JSON.stringify(ghState, null, 2), 'utf8')
+
+      // Closing with surviving claim must succeed idempotently and delete the claim
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `export default async function (drovr) {
+  const issue = {
+    repo: 'acme/widget',
+    number: 803,
+    title: 'Already closed GitHub issue',
+    body: 'Body 803',
+    url: 'https://github.com/acme/widget/issues/803',
+    state: 'CLOSED',
+    labels: ['ready-for-agent'],
+    assignees: ['drovr-bot'],
+    author: 'alice',
+    createdAt: '2026-08-18T00:00:00Z',
+    updatedAt: '2026-08-18T01:00:00Z',
+  }
+  await drovr.issues.close(issue)
+}
+`,
+        'utf8',
+      )
+
+      expect(() =>
+        execFileSync('node', [drovr, 'start'], {
+          cwd: repo,
+          env: {
+            ...process.env,
+            PATH: `${binDir}:${process.env.PATH}`,
+            GH_STATE_FILE: statePath,
+          },
+        }),
+      ).not.toThrow()
+
+      // Now the claim has been deleted; calling close again should fail with no local Claim
+      expect(() =>
+        execFileSync('node', [drovr, 'start'], {
+          cwd: repo,
+          env: {
+            ...process.env,
+            PATH: `${binDir}:${process.env.PATH}`,
+            GH_STATE_FILE: statePath,
+          },
+          stdio: 'pipe',
+        }),
+      ).toThrow(/no local Claim exists/)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves the Claim on GitHub failure', async () => {
+    const repo = await initRepo()
+    try {
+      const { binDir, statePath } = await setupMockGh(repo, {
+        defaultRepo: 'acme/widget',
+        currentUser: 'drovr-bot',
+        issues: [
+          {
+            repo: 'acme/widget',
+            number: 804,
+            title: 'Close failure test issue',
+            body: 'Body 804',
+            url: 'https://github.com/acme/widget/issues/804',
+            state: 'OPEN',
+            labels: [{ name: 'ready-for-agent' }],
+            assignees: [],
+            author: { login: 'alice' },
+            createdAt: '2026-08-18T00:00:00Z',
+            updatedAt: '2026-08-18T01:00:00Z',
+          },
+        ],
+      })
+
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      // Claim the issue
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `export default async function (drovr) {
+  const issues = await drovr.issues.list()
+  await drovr.issues.claim(issues[0], { name: 'worker-close-fail' })
+}
+`,
+        'utf8',
+      )
+
+      execFileSync('node', [drovr, 'start'], {
+        cwd: repo,
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          GH_STATE_FILE: statePath,
+        },
+      })
+
+      // Simulate next gh issue close failure
+      const ghState = JSON.parse(await readFile(statePath, 'utf8'))
+      ghState.failNextClose = true
+      await writeFile(statePath, JSON.stringify(ghState, null, 2), 'utf8')
+
+      // Attempt to close should fail
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `export default async function (drovr) {
+  const issue = {
+    repo: 'acme/widget',
+    number: 804,
+    title: 'Close failure test issue',
+    body: 'Body 804',
+    url: 'https://github.com/acme/widget/issues/804',
+    state: 'OPEN',
+    labels: ['ready-for-agent'],
+    assignees: ['drovr-bot'],
+    author: 'alice',
+    createdAt: '2026-08-18T00:00:00Z',
+    updatedAt: '2026-08-18T01:00:00Z',
+  }
+  await drovr.issues.close(issue)
+}
+`,
+        'utf8',
+      )
+
+      expect(() =>
+        execFileSync('node', [drovr, 'start'], {
+          cwd: repo,
+          env: {
+            ...process.env,
+            PATH: `${binDir}:${process.env.PATH}`,
+            GH_STATE_FILE: statePath,
+          },
+          stdio: 'pipe',
+        }),
+      ).toThrow(/Simulated GitHub API close error/)
+
+      // Claim was preserved! Retrying close succeeds
+      expect(() =>
+        execFileSync('node', [drovr, 'start'], {
+          cwd: repo,
+          env: {
+            ...process.env,
+            PATH: `${binDir}:${process.env.PATH}`,
+            GH_STATE_FILE: statePath,
+          },
+        }),
+      ).not.toThrow()
+
+      const finalGhState = JSON.parse(await readFile(statePath, 'utf8'))
+      expect(finalGhState.issues[0].state).toBe('CLOSED')
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('validates close inputs and rejects malformed Issue objects', async () => {
+    const repo = await initRepo()
+    try {
+      const { binDir, statePath } = await setupMockGh(repo, {
+        defaultRepo: 'acme/widget',
+        currentUser: 'drovr-bot',
+        issues: [],
+      })
+
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `export default async function (drovr) {
+  await drovr.issues.close({ repo: 'invalid', number: -1 })
+}
+`,
+        'utf8',
+      )
+
+      expect(() =>
+        execFileSync('node', [drovr, 'start'], {
+          cwd: repo,
+          env: {
+            ...process.env,
+            PATH: `${binDir}:${process.env.PATH}`,
+            GH_STATE_FILE: statePath,
+          },
+          stdio: 'pipe',
+        }),
+      ).toThrow(/close issue.number must be a positive integer/)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('Drovr.issues.release', () => {
+  it('fails when the Issue has no local Claim', async () => {
+    const repo = await initRepo()
+    try {
+      const { binDir, statePath } = await setupMockGh(repo, {
+        defaultRepo: 'acme/widget',
+        currentUser: 'drovr-bot',
+        issues: [
+          {
+            repo: 'acme/widget',
+            number: 901,
+            title: 'Unclaimed release attempt',
+            body: 'Body 901',
+            url: 'https://github.com/acme/widget/issues/901',
+            state: 'OPEN',
+            labels: [{ name: 'ready-for-agent' }],
+            assignees: [],
+            author: { login: 'alice' },
+            createdAt: '2026-08-18T00:00:00Z',
+            updatedAt: '2026-08-18T01:00:00Z',
+          },
+        ],
+      })
+
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `export default async function (drovr) {
+  const issues = await drovr.issues.list()
+  await drovr.issues.release(issues[0])
+}
+`,
+        'utf8',
+      )
+
+      expect(() =>
+        execFileSync('node', [drovr, 'start'], {
+          cwd: repo,
+          env: {
+            ...process.env,
+            PATH: `${binDir}:${process.env.PATH}`,
+            GH_STATE_FILE: statePath,
+          },
+          stdio: 'pipe',
+        }),
+      ).toThrow(/no local Claim exists/)
+
+      const ghState = JSON.parse(await readFile(statePath, 'utf8'))
+      expect(ghState.issues[0].state).toBe('OPEN')
+      expect(ghState.issues[0].assignees).toEqual([])
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('deletes only the local Claim and leaves the open Issue assigned, labelled, and outside the default list', async () => {
+    const repo = await initRepo()
+    try {
+      const { binDir, statePath } = await setupMockGh(repo, {
+        defaultRepo: 'acme/widget',
+        currentUser: 'drovr-bot',
+        issues: [
+          {
+            repo: 'acme/widget',
+            number: 902,
+            title: 'Release issue test',
+            body: 'Body 902',
+            url: 'https://github.com/acme/widget/issues/902',
+            state: 'OPEN',
+            labels: [{ name: 'ready-for-agent' }, { name: 'enhancement' }],
+            assignees: [],
+            author: { login: 'alice' },
+            createdAt: '2026-08-18T00:00:00Z',
+            updatedAt: '2026-08-18T01:00:00Z',
+          },
+        ],
+      })
+
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      // Claim and then Release the issue
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `export default async function (drovr) {
+  const issues = await drovr.issues.list()
+  await drovr.issues.claim(issues[0], { name: 'worker-releaser' })
+  await drovr.issues.release(issues[0])
+}
+`,
+        'utf8',
+      )
+
+      execFileSync('node', [drovr, 'start'], {
+        cwd: repo,
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          GH_STATE_FILE: statePath,
+        },
+      })
+
+      const ghState = JSON.parse(await readFile(statePath, 'utf8'))
+      const issue = ghState.issues[0]
+      // GitHub Issue remains OPEN, assigned, and labelled
+      expect(issue.state).toBe('OPEN')
+      expect(issue.assignees).toEqual([{ login: 'drovr-bot' }])
+      const labelNames = issue.labels.map((l: string | { name: string }) =>
+        typeof l === 'string' ? l : l.name,
+      )
+      expect(labelNames).toContain('ready-for-agent')
+      expect(labelNames).toContain('enhancement')
+
+      // Second run: drovr.issues.list() should NOT include issue 902 in the default list because it is assigned and not locally claimed
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import { writeFile } from 'node:fs/promises'
+export default async function (drovr) {
+  const issues = await drovr.issues.list()
+  await writeFile('result.json', JSON.stringify(issues), 'utf8')
+}
+`,
+        'utf8',
+      )
+
+      execFileSync('node', [drovr, 'start'], {
+        cwd: repo,
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          GH_STATE_FILE: statePath,
+        },
+      })
+
+      const listResult = JSON.parse(await readFile(join(repo, 'result.json'), 'utf8'))
+      expect(listResult).toHaveLength(0)
+
+      // Releasing again should fail because local claim was deleted
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `export default async function (drovr) {
+  const issue = {
+    repo: 'acme/widget',
+    number: 902,
+    title: 'Release issue test',
+    body: 'Body 902',
+    url: 'https://github.com/acme/widget/issues/902',
+    state: 'OPEN',
+    labels: ['ready-for-agent', 'enhancement'],
+    assignees: ['drovr-bot'],
+    author: 'alice',
+    createdAt: '2026-08-18T00:00:00Z',
+    updatedAt: '2026-08-18T01:00:00Z',
+  }
+  await drovr.issues.release(issue)
+}
+`,
+        'utf8',
+      )
+
+      expect(() =>
+        execFileSync('node', [drovr, 'start'], {
+          cwd: repo,
+          env: {
+            ...process.env,
+            PATH: `${binDir}:${process.env.PATH}`,
+            GH_STATE_FILE: statePath,
+          },
+          stdio: 'pipe',
+        }),
+      ).toThrow(/no local Claim exists/)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('validates release inputs and rejects malformed Issue objects', async () => {
+    const repo = await initRepo()
+    try {
+      const { binDir, statePath } = await setupMockGh(repo, {
+        defaultRepo: 'acme/widget',
+        currentUser: 'drovr-bot',
+        issues: [],
+      })
+
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `export default async function (drovr) {
+  await drovr.issues.release({ repo: '', number: 1 })
+}
+`,
+        'utf8',
+      )
+
+      expect(() =>
+        execFileSync('node', [drovr, 'start'], {
+          cwd: repo,
+          env: {
+            ...process.env,
+            PATH: `${binDir}:${process.env.PATH}`,
+            GH_STATE_FILE: statePath,
+          },
+          stdio: 'pipe',
+        }),
+      ).toThrow(/release issue.repo must be a non-empty string/)
     } finally {
       await rm(repo, { recursive: true, force: true })
     }

@@ -108,6 +108,10 @@ export function assignIssue(cwd: string, repo: string, issueNumber: number, logi
   runGh(cwd, ['issue', 'edit', String(issueNumber), '-R', repo, '--add-assignee', login])
 }
 
+export function closeIssue(cwd: string, repo: string, issueNumber: number): void {
+  runGh(cwd, ['issue', 'close', String(issueNumber), '-R', repo])
+}
+
 export function normalizeIssue(raw: RawGhIssue, repo: string): Issue {
   const labels = Object.freeze(
     Array.isArray(raw.labels)

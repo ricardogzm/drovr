@@ -1,6 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite'
 import {
   assignIssue,
+  closeIssue,
   getAuthenticatedUser,
   getRepoFromStartCheckout,
   listReadyIssues,
@@ -311,11 +312,77 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
         const user = getAuthenticatedUser(workingDir)
         assignIssue(workingDir, issue.repo, issue.number, user)
       },
-      async close() {
-        throw new Error('issues.close is not implemented yet')
+      async close(issue: Issue): Promise<void> {
+        if (typeof issue !== 'object' || issue === null) {
+          throw new TypeError('close issue must be an object')
+        }
+        if (typeof issue.repo !== 'string' || issue.repo.trim() === '') {
+          throw new TypeError('close issue.repo must be a non-empty string')
+        }
+        if (
+          typeof issue.number !== 'number' ||
+          !Number.isInteger(issue.number) ||
+          issue.number < 1
+        ) {
+          throw new TypeError('close issue.number must be a positive integer')
+        }
+
+        if (db) {
+          const existing = db
+            .prepare('SELECT name FROM claims WHERE repo = ? AND issue_number = ?')
+            .get(issue.repo, issue.number) as { name: string } | undefined
+          if (existing === undefined) {
+            throw new Error(
+              `Cannot close Issue #${issue.number} in ${issue.repo}: no local Claim exists`,
+            )
+          }
+        } else {
+          throw new Error(
+            `Cannot close Issue #${issue.number} in ${issue.repo}: no local Claim exists`,
+          )
+        }
+
+        closeIssue(workingDir, issue.repo, issue.number)
+
+        db.prepare('DELETE FROM claims WHERE repo = ? AND issue_number = ?').run(
+          issue.repo,
+          issue.number,
+        )
       },
-      async release() {
-        throw new Error('issues.release is not implemented yet')
+      async release(issue: Issue): Promise<void> {
+        if (typeof issue !== 'object' || issue === null) {
+          throw new TypeError('release issue must be an object')
+        }
+        if (typeof issue.repo !== 'string' || issue.repo.trim() === '') {
+          throw new TypeError('release issue.repo must be a non-empty string')
+        }
+        if (
+          typeof issue.number !== 'number' ||
+          !Number.isInteger(issue.number) ||
+          issue.number < 1
+        ) {
+          throw new TypeError('release issue.number must be a positive integer')
+        }
+
+        if (db) {
+          const existing = db
+            .prepare('SELECT name FROM claims WHERE repo = ? AND issue_number = ?')
+            .get(issue.repo, issue.number) as { name: string } | undefined
+          if (existing === undefined) {
+            throw new Error(
+              `Cannot release Issue #${issue.number} in ${issue.repo}: no local Claim exists`,
+            )
+          }
+        } else {
+          throw new Error(
+            `Cannot release Issue #${issue.number} in ${issue.repo}: no local Claim exists`,
+          )
+        }
+
+        db.prepare('DELETE FROM claims WHERE repo = ? AND issue_number = ?').run(
+          issue.repo,
+          issue.number,
+        )
       },
     },
   }
