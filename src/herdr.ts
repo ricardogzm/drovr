@@ -147,3 +147,94 @@ export async function promptHerdrOmpWorker(
     throw new Error('herdr agent prompt failed')
   }
 }
+
+export interface HerdrAgentInfo {
+  name: string
+  agentStatus: string
+  cwd: string
+  workspaceId?: string
+  paneId?: string
+  terminalId?: string
+}
+
+export function getHerdrAgent(commandCwd: string, name: Name): HerdrAgentInfo | null {
+  try {
+    const output = execFileSync('herdr', ['agent', 'get', name], {
+      cwd: commandCwd,
+      encoding: 'utf8',
+      env: process.env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trimEnd()
+
+    const data: unknown = JSON.parse(output)
+    if (typeof data === 'object' && data !== null) {
+      const res: unknown =
+        'result' in data && typeof data.result === 'object' && data.result !== null
+          ? data.result
+          : data
+      if (typeof res === 'object' && res !== null) {
+        const rawAgent: unknown =
+          'agent' in res && typeof res.agent === 'object' && res.agent !== null ? res.agent : res
+        if (typeof rawAgent === 'object' && rawAgent !== null) {
+          const agentObj = rawAgent as Record<string, unknown>
+          const agentName = typeof agentObj.name === 'string' ? agentObj.name : name
+          const agentStatus =
+            typeof agentObj.agent_status === 'string'
+              ? agentObj.agent_status
+              : typeof agentObj.status === 'string'
+                ? agentObj.status
+                : 'unknown'
+          const cwd =
+            typeof agentObj.cwd === 'string'
+              ? agentObj.cwd
+              : typeof agentObj.foreground_cwd === 'string'
+                ? agentObj.foreground_cwd
+                : ''
+          const workspaceId =
+            typeof agentObj.workspace_id === 'string' ? agentObj.workspace_id : undefined
+          const paneId = typeof agentObj.pane_id === 'string' ? agentObj.pane_id : undefined
+          const terminalId =
+            typeof agentObj.terminal_id === 'string' ? agentObj.terminal_id : undefined
+
+          return {
+            name: agentName,
+            agentStatus,
+            cwd,
+            workspaceId,
+            paneId,
+            terminalId,
+          }
+        }
+      }
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+export async function waitHerdrOmpWorker(
+  commandCwd: string,
+  options: { name: Name },
+): Promise<void> {
+  try {
+    await execFileAsync(
+      'herdr',
+      ['agent', 'wait', options.name, '--until', 'idle', '--until', 'done'],
+      {
+        cwd: commandCwd,
+        encoding: 'utf8',
+        env: process.env,
+      },
+    )
+  } catch (error: unknown) {
+    const stderr = extractChildStderr(error)
+    if (stderr) {
+      process.stderr.write(`${stderr}\n`)
+    }
+    if (stderr.includes('agent_prompt_stalled') || stderr.includes('stalled')) {
+      throw new Error('herdr agent wait failed: agent_prompt_stalled')
+    }
+    throw new Error('herdr agent wait failed')
+  }
+}

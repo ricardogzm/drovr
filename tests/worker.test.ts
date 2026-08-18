@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { beforeAll, describe, expect, it } from 'vitest'
+import { openProjectDatabase } from '../src/db'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const drovr = join(root, 'dist/cli.mjs')
@@ -89,6 +90,10 @@ interface MockHerdrState {
   stallAgentPromptForName?: Record<string, boolean | string>
   blockAgentOnPrompt?: Record<string, { unblockFile?: string }>
   unknownAgentOnPrompt?: Record<string, { unblockFile?: string }>
+  failNextAgentWait?: boolean | string
+  failAgentWaitForName?: Record<string, string>
+  stallAgentWaitForName?: Record<string, boolean | string>
+  blockAgentOnWait?: Record<string, { unblockFile?: string }>
   nextWorkspaceNum?: number
 }
 
@@ -526,6 +531,93 @@ if (args[0] === 'agent' && args[1] === 'prompt') {
   }))
   process.exit(0)
 }
+// Subcommand: herdr agent wait <TARGET> [OPTIONS]
+if (args[0] === 'agent' && args[1] === 'wait') {
+  const target = args[2]
+  if (!target) {
+    console.error('missing agent target')
+    process.exit(1)
+  }
+
+  if (state.failAgentWaitForName && state.failAgentWaitForName[target]) {
+    const msg = state.failAgentWaitForName[target]
+    delete state.failAgentWaitForName[target]
+    saveState()
+    console.error(msg)
+    process.exit(1)
+  }
+
+  if (state.failNextAgentWait) {
+    const msg = typeof state.failNextAgentWait === 'string' ? state.failNextAgentWait : 'Simulated agent wait error'
+    state.failNextAgentWait = false
+    saveState()
+    console.error(msg)
+    process.exit(1)
+  }
+
+  if (state.stallAgentWaitForName && state.stallAgentWaitForName[target]) {
+    const stallVal = state.stallAgentWaitForName[target]
+    delete state.stallAgentWaitForName[target]
+    saveState()
+    const msg = typeof stallVal === 'string' ? stallVal : 'agent_prompt_stalled: wait did not observe a state change within 5000ms'
+    console.error(msg)
+    process.exit(1)
+  }
+
+  const agent = state.agents.find((a) => a.name === target)
+  if (!agent) {
+    console.error('agent not found: ' + target)
+    process.exit(1)
+  }
+
+  const until = []
+  let timeout = undefined
+
+  for (let i = 3; i < args.length; i++) {
+    if (args[i] === '--until' && args[i + 1]) {
+      until.push(args[++i])
+    } else if (args[i] === '--timeout' && args[i + 1]) {
+      timeout = parseInt(args[++i], 10)
+    }
+  }
+
+  if (timeout !== undefined) {
+    console.error('error: unexpected --timeout flag passed to agent wait: ' + timeout)
+    process.exit(1)
+  }
+
+  const targetStates = until.length > 0 ? until : ['idle', 'done']
+
+  if (state.blockAgentOnWait && state.blockAgentOnWait[target]) {
+    const unblockFile = state.blockAgentOnWait[target].unblockFile
+    if (unblockFile) {
+      while (!fs.existsSync(unblockFile)) {
+        const curState = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+        const curAgent = curState.agents && curState.agents.find((a) => a.name === target)
+        if (curAgent && targetStates.includes(curAgent.agent_status)) {
+          break
+        }
+        const waitUntil = Date.now() + 20
+        while (Date.now() < waitUntil) {}
+      }
+    }
+    agent.agent_status = 'idle'
+    saveState()
+  } else {
+    agent.agent_status = 'idle'
+    saveState()
+  }
+
+  console.log(JSON.stringify({
+    id: 'req-agent-wait',
+    result: {
+      type: 'agent_waited',
+      agent
+    }
+  }))
+  process.exit(0)
+}
+
 console.error('unknown mock herdr command:', args.join(' '))
 process.exit(1)
 `
@@ -1443,6 +1535,549 @@ export default async function (drovr: Drovr) {
     expect(logContent).toContain(
       'start.fail mode=fresh started=0 skipped=0 completed=0 failed=0 error="failed to parse workspace create output"',
     )
+
+    await rm(dir, { recursive: true, force: true })
+  })
+})
+
+describe('Issue #32: Resume reconnects a live Worker by Name', () => {
+  it('Start discovers an existing idle or done Worker by Name and reconnects it without creating another workspace or starting another OMP process', async () => {
+    const dir = await initRepo()
+    const wtIdlePath = join(dir, '.worktrees/worker-idle')
+    const wtDonePath = join(dir, '.worktrees/worker-done')
+
+    const { binDir, statePath } = await setupMockHerdr(dir, {
+      nextWorkspaceNum: 3,
+      workspaces: [
+        {
+          workspace_id: 'w1',
+          number: 1,
+          label: 'worker-idle',
+          focused: false,
+          pane_count: 1,
+          tab_count: 1,
+          active_tab_id: 'w1:t1',
+          agent_status: 'idle',
+        },
+        {
+          workspace_id: 'w2',
+          number: 2,
+          label: 'worker-done',
+          focused: false,
+          pane_count: 1,
+          tab_count: 1,
+          active_tab_id: 'w2:t1',
+          agent_status: 'done',
+        },
+      ],
+      panes: [
+        {
+          pane_id: 'w1:p1',
+          terminal_id: 'term-1',
+          workspace_id: 'w1',
+          tab_id: 'w1:t1',
+          focused: false,
+          agent_status: 'idle',
+          revision: 1,
+          cwd: wtIdlePath,
+        },
+        {
+          pane_id: 'w2:p1',
+          terminal_id: 'term-2',
+          workspace_id: 'w2',
+          tab_id: 'w2:t1',
+          focused: false,
+          agent_status: 'done',
+          revision: 1,
+          cwd: wtDonePath,
+        },
+      ],
+      agents: [
+        {
+          terminal_id: 'term-1',
+          agent_status: 'idle',
+          workspace_id: 'w1',
+          tab_id: 'w1:t1',
+          pane_id: 'w1:p1',
+          focused: false,
+          revision: 1,
+          name: 'worker-idle',
+          agent: 'omp',
+          display_agent: 'OMP',
+          cwd: wtIdlePath,
+          foreground_cwd: wtIdlePath,
+          prompts: ['initial prompt idle'],
+        },
+        {
+          terminal_id: 'term-2',
+          agent_status: 'done',
+          workspace_id: 'w2',
+          tab_id: 'w2:t1',
+          pane_id: 'w2:p1',
+          focused: false,
+          revision: 1,
+          name: 'worker-done',
+          agent: 'omp',
+          display_agent: 'OMP',
+          cwd: wtDonePath,
+          foreground_cwd: wtDonePath,
+          prompts: ['initial prompt done'],
+        },
+      ],
+    })
+
+    // Create matching git worktrees so drovr.worktree reconnects them
+    runGit(dir, ['worktree', 'add', '-b', 'drovr/worker-idle', wtIdlePath, 'HEAD'])
+    runGit(dir, ['worktree', 'add', '-b', 'drovr/worker-done', wtDonePath, 'HEAD'])
+
+    await mkdir(join(dir, '.drovr'), { recursive: true })
+    openProjectDatabase(join(dir, '.drovr/state.sqlite')).close()
+
+    await writeFile(
+      join(dir, '.drovr/main.ts'),
+      `import type { Drovr } from 'drovr'
+export default async function (drovr: Drovr) {
+  await drovr.map(['worker-idle', 'worker-done'], { concurrency: 2, name: (n) => n }, async (name) => {
+    const wt = await drovr.worktree({ name })
+    const worker = await drovr.start({ name, cwd: wt.path })
+    await worker.prompt('resumed prompt for ' + name)
+  })
+}
+`,
+      'utf8',
+    )
+
+    execFileSync(process.execPath, [drovr, 'start', '--resume'], {
+      cwd: dir,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH}`,
+        HERDR_STATE_FILE: statePath,
+      },
+    })
+
+    // Verify Herdr state: exactly 2 workspaces and 2 agents (no new ones created)
+    const workspaces = listHerdrWorkspaces(binDir, statePath)
+    expect(workspaces).toHaveLength(2)
+    expect(workspaces.map((w) => w.workspace_id).sort()).toEqual(['w1', 'w2'])
+
+    const agents = listHerdrAgents(binDir, statePath)
+    expect(agents).toHaveLength(2)
+
+    const agentIdle = getHerdrAgent(binDir, statePath, 'worker-idle')
+    expect(agentIdle).not.toBeNull()
+    expect(agentIdle?.prompts).toEqual(['initial prompt idle', 'resumed prompt for worker-idle'])
+
+    const agentDone = getHerdrAgent(binDir, statePath, 'worker-done')
+    expect(agentDone).not.toBeNull()
+    expect(agentDone?.prompts).toEqual(['initial prompt done', 'resumed prompt for worker-done'])
+
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('Start requires the live Worker cwd to match the reconciled Worktree and fails the item on cwd mismatch without rebinding or moving the Worker', async () => {
+    const dir = await initRepo()
+    const foreignCwd = join(dir, 'foreign-directory')
+    await mkdir(foreignCwd, { recursive: true })
+
+    const wtMismatchPath = join(dir, '.worktrees/worker-mismatch')
+    runGit(dir, ['worktree', 'add', '-b', 'drovr/worker-mismatch', wtMismatchPath, 'HEAD'])
+
+    const { binDir, statePath } = await setupMockHerdr(dir, {
+      nextWorkspaceNum: 2,
+      workspaces: [
+        {
+          workspace_id: 'w1',
+          number: 1,
+          label: 'worker-mismatch',
+          focused: false,
+          pane_count: 1,
+          tab_count: 1,
+          active_tab_id: 'w1:t1',
+          agent_status: 'idle',
+        },
+      ],
+      panes: [
+        {
+          pane_id: 'w1:p1',
+          terminal_id: 'term-1',
+          workspace_id: 'w1',
+          tab_id: 'w1:t1',
+          focused: false,
+          agent_status: 'idle',
+          revision: 1,
+          cwd: foreignCwd,
+        },
+      ],
+      agents: [
+        {
+          terminal_id: 'term-1',
+          agent_status: 'idle',
+          workspace_id: 'w1',
+          tab_id: 'w1:t1',
+          pane_id: 'w1:p1',
+          focused: false,
+          revision: 1,
+          name: 'worker-mismatch',
+          agent: 'omp',
+          display_agent: 'OMP',
+          cwd: foreignCwd,
+          foreground_cwd: foreignCwd,
+          prompts: ['foreign prompt'],
+        },
+      ],
+    })
+
+    await mkdir(join(dir, '.drovr'), { recursive: true })
+    openProjectDatabase(join(dir, '.drovr/state.sqlite')).close()
+
+    await writeFile(
+      join(dir, '.drovr/main.ts'),
+      `import type { Drovr } from 'drovr'
+export default async function (drovr: Drovr) {
+  await drovr.map(['worker-mismatch'], { concurrency: 1, name: (n) => n }, async (name) => {
+    const wt = await drovr.worktree({ name })
+    await drovr.start({ name, cwd: wt.path })
+  })
+}
+`,
+      'utf8',
+    )
+
+    let caughtError: unknown
+    try {
+      execFileSync(process.execPath, [drovr, 'start', '--resume'], {
+        cwd: dir,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          HERDR_STATE_FILE: statePath,
+        },
+      })
+    } catch (err: unknown) {
+      caughtError = err
+    }
+
+    const errInfo = extractExecError(caughtError)
+    expect(errInfo.status).toBe(1)
+
+    const logContent = await readFile(join(dir, '.drovr/drovr.log'), 'utf8')
+    expect(logContent).toContain('map.item.fail name=worker-mismatch')
+    expect(logContent).toContain('does not match')
+
+    // Worker and workspace in Herdr remain unmodified at foreignCwd
+    const agent = getHerdrAgent(binDir, statePath, 'worker-mismatch')
+    expect(agent).not.toBeNull()
+    expect(agent?.cwd).toBe(foreignCwd)
+    expect(agent?.prompts).toEqual(['foreign prompt'])
+
+    const workspaces = listHerdrWorkspaces(binDir, statePath)
+    expect(workspaces).toHaveLength(1)
+    expect(workspaces[0].workspace_id).toBe('w1')
+
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('Start awaits an in-flight Worker turn before the resumed callback can submit another prompt', async () => {
+    const dir = await initRepo()
+    const wtPath = join(dir, '.worktrees/worker-inflight')
+    runGit(dir, ['worktree', 'add', '-b', 'drovr/worker-inflight', wtPath, 'HEAD'])
+
+    const { binDir, statePath } = await setupMockHerdr(dir, {
+      nextWorkspaceNum: 2,
+      workspaces: [
+        {
+          workspace_id: 'w1',
+          number: 1,
+          label: 'worker-inflight',
+          focused: false,
+          pane_count: 1,
+          tab_count: 1,
+          active_tab_id: 'w1:t1',
+          agent_status: 'running',
+        },
+      ],
+      panes: [
+        {
+          pane_id: 'w1:p1',
+          terminal_id: 'term-1',
+          workspace_id: 'w1',
+          tab_id: 'w1:t1',
+          focused: false,
+          agent_status: 'running',
+          revision: 1,
+          cwd: wtPath,
+        },
+      ],
+      agents: [
+        {
+          terminal_id: 'term-1',
+          agent_status: 'running',
+          workspace_id: 'w1',
+          tab_id: 'w1:t1',
+          pane_id: 'w1:p1',
+          focused: false,
+          revision: 1,
+          name: 'worker-inflight',
+          agent: 'omp',
+          display_agent: 'OMP',
+          cwd: wtPath,
+          foreground_cwd: wtPath,
+          prompts: ['first prompt running'],
+        },
+      ],
+    })
+
+    await mkdir(join(dir, '.drovr'), { recursive: true })
+    openProjectDatabase(join(dir, '.drovr/state.sqlite')).close()
+
+    await writeFile(
+      join(dir, '.drovr/main.ts'),
+      `import type { Drovr } from 'drovr'
+export default async function (drovr: Drovr) {
+  await drovr.map(['worker-inflight'], { concurrency: 1, name: (n) => n }, async (name) => {
+    const wt = await drovr.worktree({ name })
+    const worker = await drovr.start({ name, cwd: wt.path })
+    await worker.prompt('second prompt')
+  })
+}
+`,
+      'utf8',
+    )
+
+    execFileSync(process.execPath, [drovr, 'start', '--resume'], {
+      cwd: dir,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH}`,
+        HERDR_STATE_FILE: statePath,
+      },
+    })
+
+    const agent = getHerdrAgent(binDir, statePath, 'worker-inflight')
+    expect(agent).not.toBeNull()
+    expect(agent?.agent_status).toBe('idle')
+    expect(agent?.prompts).toEqual(['first prompt running', 'second prompt'])
+
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('An absent Worker takes the normal fresh-start path without OMP continue/resume flags', async () => {
+    const dir = await initRepo()
+    const wtFreshPath = join(dir, '.worktrees/worker-fresh')
+    runGit(dir, ['worktree', 'add', '-b', 'drovr/worker-fresh', wtFreshPath, 'HEAD'])
+    const { binDir, statePath } = await setupMockHerdr(dir)
+
+    await mkdir(join(dir, '.drovr'), { recursive: true })
+    openProjectDatabase(join(dir, '.drovr/state.sqlite')).close()
+    await writeFile(
+      join(dir, '.drovr/main.ts'),
+      `import type { Drovr } from 'drovr'
+export default async function (drovr: Drovr) {
+  await drovr.map(['worker-fresh'], { concurrency: 1, name: (n) => n }, async (name) => {
+    const wt = await drovr.worktree({ name })
+    const worker = await drovr.start({ name, cwd: wt.path })
+    await worker.prompt('first prompt')
+  })
+}
+`,
+      'utf8',
+    )
+
+    execFileSync(process.execPath, [drovr, 'start', '--resume'], {
+      cwd: dir,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH}`,
+        HERDR_STATE_FILE: statePath,
+      },
+    })
+
+    const workspaces = listHerdrWorkspaces(binDir, statePath)
+    expect(workspaces).toHaveLength(1)
+    expect(workspaces[0].label).toBe('worker-fresh')
+
+    const agent = getHerdrAgent(binDir, statePath, 'worker-fresh')
+    expect(agent).not.toBeNull()
+    expect(agent?.agent).toBe('omp')
+    expect(agent?.prompts).toEqual(['first prompt'])
+
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('A stalled in-flight wait fails the item without retry', async () => {
+    const dir = await initRepo()
+    const wtPath = join(dir, '.worktrees/worker-stalled')
+    runGit(dir, ['worktree', 'add', '-b', 'drovr/worker-stalled', wtPath, 'HEAD'])
+
+    const { binDir, statePath } = await setupMockHerdr(dir, {
+      nextWorkspaceNum: 2,
+      workspaces: [
+        {
+          workspace_id: 'w1',
+          number: 1,
+          label: 'worker-stalled',
+          focused: false,
+          pane_count: 1,
+          tab_count: 1,
+          active_tab_id: 'w1:t1',
+          agent_status: 'running',
+        },
+      ],
+      panes: [
+        {
+          pane_id: 'w1:p1',
+          terminal_id: 'term-1',
+          workspace_id: 'w1',
+          tab_id: 'w1:t1',
+          focused: false,
+          agent_status: 'running',
+          revision: 1,
+          cwd: wtPath,
+        },
+      ],
+      agents: [
+        {
+          terminal_id: 'term-1',
+          agent_status: 'running',
+          workspace_id: 'w1',
+          tab_id: 'w1:t1',
+          pane_id: 'w1:p1',
+          focused: false,
+          revision: 1,
+          name: 'worker-stalled',
+          agent: 'omp',
+          display_agent: 'OMP',
+          cwd: wtPath,
+          foreground_cwd: wtPath,
+          prompts: ['stalled prompt'],
+        },
+      ],
+      stallAgentWaitForName: {
+        'worker-stalled': 'agent_prompt_stalled: wait did not observe state change',
+      },
+    })
+
+    await mkdir(join(dir, '.drovr'), { recursive: true })
+    openProjectDatabase(join(dir, '.drovr/state.sqlite')).close()
+
+    await writeFile(
+      join(dir, '.drovr/main.ts'),
+      `import type { Drovr } from 'drovr'
+export default async function (drovr: Drovr) {
+  await drovr.map(['worker-stalled'], { concurrency: 1, name: (n) => n }, async (name) => {
+    const wt = await drovr.worktree({ name })
+    const worker = await drovr.start({ name, cwd: wt.path })
+    await worker.prompt('will not execute')
+  })
+}
+`,
+      'utf8',
+    )
+
+    let caughtError: unknown
+    try {
+      execFileSync(process.execPath, [drovr, 'start', '--resume'], {
+        cwd: dir,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          HERDR_STATE_FILE: statePath,
+        },
+      })
+    } catch (err: unknown) {
+      caughtError = err
+    }
+
+    const errInfo = extractExecError(caughtError)
+    expect(errInfo.status).toBe(1)
+
+    const logContent = await readFile(join(dir, '.drovr/drovr.log'), 'utf8')
+    expect(logContent).toContain('map.item.fail name=worker-stalled')
+    expect(logContent).toContain('herdr agent wait failed: agent_prompt_stalled')
+
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('A crash-and-resume process scenario verifies reconnection through visible Herdr state', async () => {
+    const dir = await initRepo()
+    const { binDir, statePath } = await setupMockHerdr(dir)
+
+    await mkdir(join(dir, '.drovr'), { recursive: true })
+    // Workflow passes first step (prompt 1), throws on fresh run, and completes on resume
+    await writeFile(
+      join(dir, '.drovr/main.ts'),
+      `import type { Drovr } from 'drovr'
+import { existsSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+
+export default async function (drovr: Drovr) {
+  await drovr.map(['item-crash'], { concurrency: 1, name: (n) => n }, async (name) => {
+    const wt = await drovr.worktree({ name })
+    const worker = await drovr.start({ name, cwd: wt.path })
+    const crashFlag = join(wt.path, '.crashed')
+    if (!existsSync(crashFlag)) {
+      await worker.prompt('prompt turn 1')
+      writeFileSync(crashFlag, 'true', 'utf8')
+      throw new Error('Simulated process crash after prompt 1')
+    }
+    await worker.prompt('prompt turn 2 on resume')
+  })
+}
+`,
+      'utf8',
+    )
+
+    // First run (fresh): should execute prompt 1 and throw
+    let firstRunError: unknown
+    try {
+      execFileSync(process.execPath, [drovr, 'start'], {
+        cwd: dir,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          HERDR_STATE_FILE: statePath,
+        },
+      })
+    } catch (err: unknown) {
+      firstRunError = err
+    }
+
+    const firstErr = extractExecError(firstRunError)
+    expect(firstErr.status).toBe(1)
+
+    // In Herdr: workspace and agent survive
+    const wsAfterCrash = listHerdrWorkspaces(binDir, statePath)
+    expect(wsAfterCrash).toHaveLength(1)
+    const agentAfterCrash = getHerdrAgent(binDir, statePath, 'item-crash')
+    expect(agentAfterCrash).not.toBeNull()
+    expect(agentAfterCrash?.prompts).toEqual(['prompt turn 1'])
+
+    // Second run (--resume): reconnects live worker and finishes prompt 2
+    execFileSync(process.execPath, [drovr, 'start', '--resume'], {
+      cwd: dir,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH}`,
+        HERDR_STATE_FILE: statePath,
+      },
+    })
+
+    // Verify Herdr state: still exactly 1 workspace and 1 agent, both prompts executed in order
+    const wsAfterResume = listHerdrWorkspaces(binDir, statePath)
+    expect(wsAfterResume).toHaveLength(1)
+    expect(wsAfterResume[0].workspace_id).toBe(wsAfterCrash[0].workspace_id)
+
+    const agentAfterResume = getHerdrAgent(binDir, statePath, 'item-crash')
+    expect(agentAfterResume).not.toBeNull()
+    expect(agentAfterResume?.prompts).toEqual(['prompt turn 1', 'prompt turn 2 on resume'])
 
     await rm(dir, { recursive: true, force: true })
   })

@@ -25,8 +25,10 @@ import { runWorktreeSetup } from './worktree-setup'
 import {
   closeHerdrWorkspace,
   createHerdrWorkspace,
+  getHerdrAgent,
   promptHerdrOmpWorker,
   startHerdrOmpWorker,
+  waitHerdrOmpWorker,
 } from './herdr'
 import type { Drovr, Issue, Name, Worker, Worktree } from './index'
 import type { DrovrLogger, DrovrLoggerCounts } from './log'
@@ -406,6 +408,43 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
       const name = opts.name
       const targetCwd = opts.cwd
 
+      const createWorkerHandle = (): Worker =>
+        Object.freeze({
+          async prompt(text: string): Promise<void> {
+            if (typeof text !== 'string') {
+              throw new TypeError('prompt text must be a string')
+            }
+            if (activePrompts.has(name)) {
+              throw new Error(`worker "${name}" is already executing a prompt`)
+            }
+            activePrompts.add(name)
+            try {
+              await promptHerdrOmpWorker(workingDir, { name, text })
+            } finally {
+              activePrompts.delete(name)
+            }
+          },
+        })
+
+      if (mode === 'resume') {
+        const existingAgent = getHerdrAgent(workingDir, name)
+        if (existingAgent) {
+          const canonicalExistingCwd = safeRealpath(existingAgent.cwd)
+          const canonicalTargetCwd = safeRealpath(targetCwd)
+          if (canonicalExistingCwd !== canonicalTargetCwd && existingAgent.cwd !== targetCwd) {
+            throw new Error(
+              `Cannot resume Worker "${name}": Worker cwd "${existingAgent.cwd}" does not match Worktree path "${targetCwd}".`,
+            )
+          }
+
+          if (existingAgent.agentStatus !== 'idle' && existingAgent.agentStatus !== 'done') {
+            await waitHerdrOmpWorker(workingDir, { name })
+          }
+
+          return createWorkerHandle()
+        }
+      }
+
       const { workspaceId, rootPaneId } = createHerdrWorkspace(workingDir, {
         workspaceCwd: targetCwd,
         label: name,
@@ -424,22 +463,7 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
         throw err
       }
 
-      return Object.freeze({
-        async prompt(text: string): Promise<void> {
-          if (typeof text !== 'string') {
-            throw new TypeError('prompt text must be a string')
-          }
-          if (activePrompts.has(name)) {
-            throw new Error(`worker "${name}" is already executing a prompt`)
-          }
-          activePrompts.add(name)
-          try {
-            await promptHerdrOmpWorker(workingDir, { name, text })
-          } finally {
-            activePrompts.delete(name)
-          }
-        },
-      })
+      return createWorkerHandle()
     },
     issues: {
       async list(opts?: { repo?: string }): Promise<readonly Issue[]> {
