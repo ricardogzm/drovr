@@ -109,6 +109,53 @@ export default async function workflow(drovr: Drovr) {
     }
   })
 
+  it('rejects ports-only spec before capacity is implemented', async () => {
+    const repo = await initRepo()
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from 'drovr'
+export default async function workflow(drovr: Drovr) {
+  // @ts-expect-error test ports-only spec
+  await drovr.resource('res', { ports: 3000 })
+}
+`,
+        'utf8',
+      )
+
+      expect(() => execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })).toThrow(
+        /positive integer/,
+      )
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('returns a frozen Resource handle', async () => {
+    const repo = await initRepo()
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from 'drovr'
+import { writeFile } from 'node:fs/promises'
+
+export default async function workflow(drovr: Drovr) {
+  const res = await drovr.resource('res', { capacity: 1 })
+  const isFrozen = Object.isFrozen(res)
+  await writeFile('frozen.txt', String(isFrozen), 'utf8')
+}
+`,
+        'utf8',
+      )
+
+      execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })
+      expect(await readFile(join(repo, 'frozen.txt'), 'utf8')).toBe('true')
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
   it('rejects invalid lease options or invalid Names', async () => {
     const repo = await initRepo()
     try {

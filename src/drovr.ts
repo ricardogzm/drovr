@@ -58,7 +58,7 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
   const resourceReleaseNotifier = new EventEmitter()
   resourceReleaseNotifier.setMaxListeners(0)
 
-  async function waitForResourceLease(resourceName: string): Promise<void> {
+  async function waitForResourceRelease(resourceName: string): Promise<void> {
     await new Promise<void>((resolve) => {
       let timer: NodeJS.Timeout | undefined
       const onRelease = () => {
@@ -95,47 +95,45 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
       if ('capacity' in spec && 'ports' in spec) {
         throw new TypeError('resource spec cannot contain both capacity and ports')
       }
-      if (!('capacity' in spec) && !('ports' in spec)) {
-        throw new TypeError('resource spec must declare capacity or ports')
+      if (!('capacity' in spec)) {
+        throw new TypeError('resource capacity must be a positive integer')
       }
 
-      if ('capacity' in spec) {
-        const capacity = spec.capacity
-        if (typeof capacity !== 'number' || !Number.isInteger(capacity) || capacity < 1) {
-          throw new TypeError('resource capacity must be a positive integer')
-        }
+      const capacity = spec.capacity
+      if (typeof capacity !== 'number' || !Number.isInteger(capacity) || capacity < 1) {
+        throw new TypeError('resource capacity must be a positive integer')
+      }
 
-        if (db) {
-          const existing = db
-            .prepare('SELECT type, capacity FROM resources WHERE name = ?')
-            .get(name) as { type: string; capacity: number } | undefined
+      if (db) {
+        const existing = db
+          .prepare('SELECT type, capacity FROM resources WHERE name = ?')
+          .get(name) as { type: string; capacity: number } | undefined
 
-          if (existing !== undefined) {
-            const occupancyRow = db
-              .prepare('SELECT COUNT(*) as count FROM leases WHERE resource_name = ?')
-              .get(name) as { count: number }
-            const occupancy = occupancyRow.count
-            if (capacity < occupancy) {
-              throw new Error(
-                `cannot reduce capacity of resource "${name}" from ${existing.capacity} to ${capacity} below live occupancy of ${occupancy}`,
-              )
-            }
-            db.prepare('UPDATE resources SET type = ?, capacity = ? WHERE name = ?').run(
-              'capacity',
-              capacity,
-              name,
-            )
-          } else {
-            db.prepare('INSERT INTO resources (name, type, capacity) VALUES (?, ?, ?)').run(
-              name,
-              'capacity',
-              capacity,
+        if (existing !== undefined) {
+          const occupancyRow = db
+            .prepare('SELECT COUNT(*) as count FROM leases WHERE resource_name = ?')
+            .get(name) as { count: number }
+          const occupancy = occupancyRow.count
+          if (capacity < occupancy) {
+            throw new Error(
+              `cannot reduce capacity of resource "${name}" from ${existing.capacity} to ${capacity} below live occupancy of ${occupancy}`,
             )
           }
+          db.prepare('UPDATE resources SET type = ?, capacity = ? WHERE name = ?').run(
+            'capacity',
+            capacity,
+            name,
+          )
+        } else {
+          db.prepare('INSERT INTO resources (name, type, capacity) VALUES (?, ?, ?)').run(
+            name,
+            'capacity',
+            capacity,
+          )
         }
       }
 
-      return {
+      return Object.freeze({
         async lease<T>(opts: { name: Name }, fn: () => Promise<T>): Promise<T> {
           if (typeof opts !== 'object' || opts === null) {
             throw new TypeError('lease options must be an object')
@@ -212,7 +210,7 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
               logger?.resourceLeaseWait(name, opts.name)
             }
 
-            await waitForResourceLease(name)
+            await waitForResourceRelease(name)
           }
 
           logger?.resourceLeaseAcquire(name, opts.name)
@@ -222,23 +220,20 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
           } finally {
             const remaining = (activeLeaseCounts.get(leaseKey) ?? 1) - 1
             if (remaining <= 0) {
-              activeLeaseCounts.delete(leaseKey)
               if (db) {
-                try {
-                  db.prepare('DELETE FROM leases WHERE resource_name = ? AND name = ?').run(
-                    name,
-                    opts.name,
-                  )
-                } catch {}
+                db.prepare('DELETE FROM leases WHERE resource_name = ? AND name = ?').run(
+                  name,
+                  opts.name,
+                )
               }
+              activeLeaseCounts.delete(leaseKey)
               resourceReleaseNotifier.emit(`release:${name}`)
-              resourceReleaseNotifier.emit('release', name)
             } else {
               activeLeaseCounts.set(leaseKey, remaining)
             }
           }
         },
-      }
+      })
     },
     async map<T>(
       items: readonly T[],
