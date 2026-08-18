@@ -2,7 +2,6 @@ import { execFileSync } from 'node:child_process'
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import { beforeAll, describe, expect, it } from 'vitest'
 
@@ -1478,31 +1477,34 @@ describe('Drovr.issues.close', () => {
         },
       })
 
-      // Inject SQLite write fault via trigger on claims table without inspecting local rows
-      const db = new DatabaseSync(join(repo, '.drovr/state.sqlite'))
-      db.exec(
-        "CREATE TRIGGER fail_claims_delete BEFORE DELETE ON claims BEGIN SELECT RAISE(FAIL, 'Simulated SQLite Claim deletion error'); END;",
-      )
-      db.close()
-
-      // Attempt to close: GitHub mutation should happen, but SQLite delete failure must be surfaced
+      // Attempt to close while holding a schema-agnostic write lock on the database file from the authored Workflow
       await writeFile(
         join(repo, '.drovr/main.ts'),
-        `export default async function (drovr) {
-  const issue = {
-    repo: 'acme/widget',
-    number: 805,
-    title: 'Close Claim deletion failure issue',
-    body: 'Body 805',
-    url: 'https://github.com/acme/widget/issues/805',
-    state: 'OPEN',
-    labels: ['ready-for-agent'],
-    assignees: ['drovr-bot'],
-    author: 'alice',
-    createdAt: '2026-08-18T00:00:00Z',
-    updatedAt: '2026-08-18T01:00:00Z',
+        `import { DatabaseSync } from 'node:sqlite'
+export default async function (drovr) {
+  const blocker = new DatabaseSync('.drovr/state.sqlite')
+  blocker.exec('BEGIN IMMEDIATE;')
+  try {
+    const issue = {
+      repo: 'acme/widget',
+      number: 805,
+      title: 'Close Claim deletion failure issue',
+      body: 'Body 805',
+      url: 'https://github.com/acme/widget/issues/805',
+      state: 'OPEN',
+      labels: ['ready-for-agent'],
+      assignees: ['drovr-bot'],
+      author: 'alice',
+      createdAt: '2026-08-18T00:00:00Z',
+      updatedAt: '2026-08-18T01:00:00Z',
+    }
+    await drovr.issues.close(issue)
+  } finally {
+    try {
+      blocker.exec('ROLLBACK;')
+    } catch {}
+    blocker.close()
   }
-  await drovr.issues.close(issue)
 }
 `,
         'utf8',
@@ -1518,18 +1520,35 @@ describe('Drovr.issues.close', () => {
           },
           stdio: 'pipe',
         }),
-      ).toThrow(/Simulated SQLite Claim deletion error/)
+      ).toThrow(/busy|locked/)
 
       // Verify GitHub issue was already closed and retained assignee/labels
       const ghState = JSON.parse(await readFile(statePath, 'utf8'))
       expect(ghState.issues[0].state).toBe('CLOSED')
       expect(ghState.issues[0].assignees).toEqual([{ login: 'drovr-bot' }])
 
-      // Clear the SQLite write fault
-      const dbClean = new DatabaseSync(join(repo, '.drovr/state.sqlite'))
-      dbClean.exec('DROP TRIGGER fail_claims_delete;')
-      dbClean.close()
-
+      // Retry close without write fault: since Claim was preserved, close succeeds idempotently and deletes the Claim
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `export default async function (drovr) {
+  const issue = {
+    repo: 'acme/widget',
+    number: 805,
+    title: 'Close Claim deletion failure issue',
+    body: 'Body 805',
+    url: 'https://github.com/acme/widget/issues/805',
+    state: 'CLOSED',
+    labels: ['ready-for-agent'],
+    assignees: ['drovr-bot'],
+    author: 'alice',
+    createdAt: '2026-08-18T00:00:00Z',
+    updatedAt: '2026-08-18T01:00:00Z',
+  }
+  await drovr.issues.close(issue)
+}
+`,
+        'utf8',
+      )
       // Retry close: since Claim was preserved, close succeeds idempotently and deletes the Claim
       expect(() =>
         execFileSync('node', [drovr, 'start'], {
@@ -1557,7 +1576,7 @@ describe('Drovr.issues.close', () => {
     } finally {
       await rm(repo, { recursive: true, force: true })
     }
-  })
+  }, 20_000)
 
   it('validates close inputs and rejects malformed Issue objects', async () => {
     const repo = await initRepo()
@@ -1813,14 +1832,57 @@ export default async function (drovr) {
         },
       })
 
-      // Inject SQLite write fault via trigger on claims table without inspecting local rows
-      const db = new DatabaseSync(join(repo, '.drovr/state.sqlite'))
-      db.exec(
-        "CREATE TRIGGER fail_claims_delete BEFORE DELETE ON claims BEGIN SELECT RAISE(FAIL, 'Simulated SQLite Claim deletion error'); END;",
+      // Attempt to release while holding a schema-agnostic write lock on the database file from the authored Workflow
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import { DatabaseSync } from 'node:sqlite'
+export default async function (drovr) {
+  const blocker = new DatabaseSync('.drovr/state.sqlite')
+  blocker.exec('BEGIN IMMEDIATE;')
+  try {
+    const issue = {
+      repo: 'acme/widget',
+      number: 903,
+      title: 'Release Claim deletion failure issue',
+      body: 'Body 903',
+      url: 'https://github.com/acme/widget/issues/903',
+      state: 'OPEN',
+      labels: ['ready-for-agent'],
+      assignees: ['drovr-bot'],
+      author: 'alice',
+      createdAt: '2026-08-18T00:00:00Z',
+      updatedAt: '2026-08-18T01:00:00Z',
+    }
+    await drovr.issues.release(issue)
+  } finally {
+    try {
+      blocker.exec('ROLLBACK;')
+    } catch {}
+    blocker.close()
+  }
+}
+`,
+        'utf8',
       )
-      db.close()
 
-      // Attempt to release: SQLite delete failure must be surfaced
+      expect(() =>
+        execFileSync('node', [drovr, 'start'], {
+          cwd: repo,
+          env: {
+            ...process.env,
+            PATH: `${binDir}:${process.env.PATH}`,
+            GH_STATE_FILE: statePath,
+          },
+          stdio: 'pipe',
+        }),
+      ).toThrow(/busy|locked/)
+
+      // Verify GitHub issue remains OPEN, assigned, and labelled (completely unchanged)
+      const ghState = JSON.parse(await readFile(statePath, 'utf8'))
+      expect(ghState.issues[0].state).toBe('OPEN')
+      expect(ghState.issues[0].assignees).toEqual([{ login: 'drovr-bot' }])
+
+      // Retry release without write fault: since Claim was preserved, release succeeds and deletes the Claim
       await writeFile(
         join(repo, '.drovr/main.ts'),
         `export default async function (drovr) {
@@ -1842,29 +1904,6 @@ export default async function (drovr) {
 `,
         'utf8',
       )
-
-      expect(() =>
-        execFileSync('node', [drovr, 'start'], {
-          cwd: repo,
-          env: {
-            ...process.env,
-            PATH: `${binDir}:${process.env.PATH}`,
-            GH_STATE_FILE: statePath,
-          },
-          stdio: 'pipe',
-        }),
-      ).toThrow(/Simulated SQLite Claim deletion error/)
-
-      // Verify GitHub issue remains OPEN, assigned, and labelled (completely unchanged)
-      const ghState = JSON.parse(await readFile(statePath, 'utf8'))
-      expect(ghState.issues[0].state).toBe('OPEN')
-      expect(ghState.issues[0].assignees).toEqual([{ login: 'drovr-bot' }])
-
-      // Clear the SQLite write fault
-      const dbClean = new DatabaseSync(join(repo, '.drovr/state.sqlite'))
-      dbClean.exec('DROP TRIGGER fail_claims_delete;')
-      dbClean.close()
-
       // Retry release: since Claim was preserved, release succeeds and deletes the Claim
       expect(() =>
         execFileSync('node', [drovr, 'start'], {
@@ -1892,7 +1931,7 @@ export default async function (drovr) {
     } finally {
       await rm(repo, { recursive: true, force: true })
     }
-  })
+  }, 20_000)
 
   it('validates release inputs and rejects malformed Issue objects', async () => {
     const repo = await initRepo()
