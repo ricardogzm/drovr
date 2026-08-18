@@ -296,7 +296,8 @@ export default async function workflow(drovr: Drovr): Promise<void> {
 
       expect(exitCode).toBe(0)
       expect(liveTokenSeenBeforeExit).toBe(true)
-      expect(fullStdout).toContain('[live-stdout-item setup 1/1] live-token completed\n')
+      expect(fullStdout).toContain('[live-stdout-item setup 1/1] live-token')
+      expect(fullStdout).toContain('[live-stdout-item setup 1/1]  completed')
     } finally {
       await rm(repo, { recursive: true, force: true })
     }
@@ -350,7 +351,8 @@ export default async function workflow(drovr: Drovr): Promise<void> {
 
       expect(exitCode).toBe(0)
       expect(liveErrTokenSeenBeforeExit).toBe(true)
-      expect(fullStderr).toContain('[live-stderr-item setup 1/1] live-err-token err-completed\n')
+      expect(fullStderr).toContain('[live-stderr-item setup 1/1] live-err-token')
+      expect(fullStderr).toContain('[live-stderr-item setup 1/1]  err-completed')
     } finally {
       await rm(repo, { recursive: true, force: true })
     }
@@ -662,7 +664,7 @@ export default async function workflow(drovr: Drovr): Promise<void> {
       await writeFile(
         join(repo, '.drovr', 'worktrees.json'),
         JSON.stringify([
-          `name="$(basename "$PWD")"; if [ "$name" = "item-a" ]; then printf "a-partial" && touch "${syncDir}/a_started" && while [ ! -f "${syncDir}/b_done" ]; do sleep 0.05; done && echo "-continuation"; else while [ ! -f "${syncDir}/a_started" ]; do sleep 0.05; done && echo "b-full-line" && touch "${syncDir}/b_done"; fi`,
+          `name="$(basename "$PWD")"; if [ "$name" = "item-a" ]; then printf "a-partial\n" && touch "${syncDir}/a_started" && while [ ! -f "${syncDir}/b_done" ]; do sleep 0.05; done && echo "-continuation"; else while [ ! -f "${syncDir}/a_started" ]; do sleep 0.05; done && echo "b-full-line" && touch "${syncDir}/b_done"; fi`,
         ]),
         'utf8',
       )
@@ -715,9 +717,8 @@ export default async function workflow(drovr: Drovr): Promise<void> {
       await writeFile(
         join(repo, '.drovr', 'worktrees.json'),
         JSON.stringify([
-          `name="$(basename "$PWD")"; if [ "$name" = "item-a" ]; then printf "a-err-partial" >&2 && touch "${syncDir}/a_err_started" && while [ ! -f "${syncDir}/b_err_done" ]; do sleep 0.05; done && echo "-err-continuation" >&2; else while [ ! -f "${syncDir}/a_err_started" ]; do sleep 0.05; done && echo "b-err-full-line" >&2 && touch "${syncDir}/b_err_done"; fi`,
+          `name="$(basename "$PWD")"; if [ "$name" = "item-a" ]; then printf "a-err-partial\n" >&2 && touch "${syncDir}/a_err_started" && while [ ! -f "${syncDir}/b_err_done" ]; do sleep 0.05; done && echo "-err-continuation" >&2; else while [ ! -f "${syncDir}/a_err_started" ]; do sleep 0.05; done && echo "b-err-full-line" >&2 && touch "${syncDir}/b_err_done"; fi`,
         ]),
-        'utf8',
       )
       await writeFile(
         join(repo, '.drovr/main.ts'),
@@ -756,6 +757,103 @@ export default async function workflow(drovr: Drovr): Promise<void> {
       for (const line of lines) {
         expect(line).toMatch(/^\[(?:item-a|item-b) setup 1\/1\] /)
       }
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+      await rm(syncDir, { recursive: true, force: true })
+    }
+  })
+  it('preserves self-identifying setup framing when direct stdout writes interleave between partial setup and continuation', async () => {
+    const repo = await initRepo()
+    const syncDir = await mkdtemp(join(tmpdir(), 'drovr-direct-stdout-'))
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr', 'worktrees.json'),
+        JSON.stringify([
+          `printf "setup-stdout-partial\n" && touch "${syncDir}/partial_emitted" && while [ ! -f "${syncDir}/direct_written" ]; do sleep 0.05; done && echo "setup-stdout-continuation"`,
+        ]),
+      )
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+import { existsSync } from "node:fs"
+import { writeFile } from "node:fs/promises"
+
+export default async function workflow(drovr: Drovr): Promise<void> {
+  const wtPromise = drovr.worktree({ name: 'direct-stdout-item' })
+  while (!existsSync("${syncDir}/partial_emitted")) {
+    await new Promise((r) => setTimeout(r, 20))
+  }
+  process.stdout.write("Direct stdout message\\n")
+  await writeFile("${syncDir}/direct_written", "1", "utf8")
+  await wtPromise
+}
+`,
+        'utf8',
+      )
+      runGit(repo, ['add', '.drovr'])
+      runGit(repo, ['commit', '-m', 'add direct stdout interleave test'])
+
+      const proc = spawnSync('node', [drovr, 'start'], {
+        cwd: repo,
+        encoding: 'utf8',
+      })
+
+      expect(proc.status).toBe(0)
+      const lines = proc.stdout.trim().split('\n')
+      expect(lines).toContain('[direct-stdout-item setup 1/1] setup-stdout-partial')
+      expect(lines).toContain('Direct stdout message')
+      expect(lines).toContain('[direct-stdout-item setup 1/1] setup-stdout-continuation')
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+      await rm(syncDir, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves self-identifying setup framing when direct stderr warning writes interleave between partial setup and continuation', async () => {
+    const repo = await initRepo()
+    const syncDir = await mkdtemp(join(tmpdir(), 'drovr-direct-stderr-'))
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr', 'worktrees.json'),
+        JSON.stringify([
+          `printf "setup-stderr-partial\n" >&2 && touch "${syncDir}/err_partial_emitted" && while [ ! -f "${syncDir}/direct_err_written" ]; do sleep 0.05; done && echo "setup-stderr-continuation" >&2`,
+        ]),
+      )
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+import { existsSync } from "node:fs"
+import { writeFile } from "node:fs/promises"
+
+export default async function workflow(drovr: Drovr): Promise<void> {
+  const wtPromise = drovr.worktree({ name: 'direct-stderr-item' })
+  while (!existsSync("${syncDir}/err_partial_emitted")) {
+    await new Promise((r) => setTimeout(r, 20))
+  }
+  process.stderr.write("Warning: direct diagnostic warning\\n")
+  await writeFile("${syncDir}/direct_err_written", "1", "utf8")
+  await wtPromise
+}
+`,
+        'utf8',
+      )
+      runGit(repo, ['add', '.drovr'])
+      runGit(repo, ['commit', '-m', 'add direct stderr interleave test'])
+
+      const proc = spawnSync('node', [drovr, 'start'], {
+        cwd: repo,
+        encoding: 'utf8',
+      })
+
+      expect(proc.status).toBe(0)
+      const lines = proc.stderr.trim().split('\n')
+      expect(lines).toContain('[direct-stderr-item setup 1/1] setup-stderr-partial')
+      expect(lines).toContain('Warning: direct diagnostic warning')
+      expect(lines).toContain('[direct-stderr-item setup 1/1] setup-stderr-continuation')
     } finally {
       await rm(repo, { recursive: true, force: true })
       await rm(syncDir, { recursive: true, force: true })
