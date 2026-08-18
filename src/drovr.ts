@@ -22,7 +22,12 @@ import {
   safeRealpath,
 } from './git'
 import { runWorktreeSetup } from './worktree-setup'
-import { closeHerdrWorkspace, createHerdrWorkspace, startHerdrOmpWorker } from './herdr'
+import {
+  closeHerdrWorkspace,
+  createHerdrWorkspace,
+  promptHerdrOmpWorker,
+  startHerdrOmpWorker,
+} from './herdr'
 import type { Drovr, Issue, Name, Worker, Worktree } from './index'
 import type { DrovrLogger, DrovrLoggerCounts } from './log'
 import { mergeExactLine } from './merge-line'
@@ -45,6 +50,7 @@ export function isValidName(name: unknown): name is Name {
 export function createDrovr(context: DrovrContext = {}): Drovr {
   const { db, logger, counts, root, cwd, mode = 'fresh' } = context
   const workingDir = root ?? cwd ?? process.cwd()
+  const activePrompts = new Set<Name>()
   return {
     async resource() {
       throw new Error('resource is not implemented yet')
@@ -419,8 +425,19 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
       }
 
       return Object.freeze({
-        async prompt(): Promise<void> {
-          throw new Error('prompt is not implemented yet')
+        async prompt(text: string): Promise<void> {
+          if (typeof text !== 'string') {
+            throw new TypeError('prompt text must be a string')
+          }
+          if (activePrompts.has(name)) {
+            throw new Error(`worker "${name}" is already executing a prompt`)
+          }
+          activePrompts.add(name)
+          try {
+            await promptHerdrOmpWorker(workingDir, { name, text })
+          } finally {
+            activePrompts.delete(name)
+          }
         },
       })
     },

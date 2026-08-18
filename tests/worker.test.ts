@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -61,6 +61,7 @@ interface MockHerdrAgent {
   display_agent: string
   cwd: string
   foreground_cwd: string
+  prompts?: string[]
 }
 
 interface MockHerdrPane {
@@ -81,6 +82,10 @@ interface MockHerdrState {
   failNextWorkspaceCreate?: boolean | string
   failNextAgentStart?: boolean | string
   failAgentStartForName?: Record<string, string>
+  failNextAgentPrompt?: boolean | string
+  failAgentPromptForName?: Record<string, string>
+  stallAgentPromptForName?: Record<string, boolean>
+  blockAgentOnPrompt?: Record<string, { unblockFile?: string }>
   nextWorkspaceNum?: number
 }
 
@@ -373,6 +378,120 @@ if (args[0] === 'agent' && args[1] === 'list') {
     result: {
       type: 'agent_list',
       agents: state.agents
+    }
+  }))
+  process.exit(0)
+}
+// Subcommand: herdr agent prompt <TARGET> <TEXT> [OPTIONS]
+if (args[0] === 'agent' && args[1] === 'prompt') {
+  const target = args[2]
+  const text = args[3]
+  if (!target) {
+    console.error('missing agent target')
+    process.exit(1)
+  }
+  if (text === undefined) {
+    console.error('missing prompt text')
+    process.exit(1)
+  }
+
+  if (state.failAgentPromptForName && state.failAgentPromptForName[target]) {
+    const msg = state.failAgentPromptForName[target]
+    delete state.failAgentPromptForName[target]
+    saveState()
+    console.error(msg)
+    process.exit(1)
+  }
+
+  if (state.failNextAgentPrompt) {
+    const msg = typeof state.failNextAgentPrompt === 'string' ? state.failNextAgentPrompt : 'Simulated agent prompt error'
+    state.failNextAgentPrompt = false
+    saveState()
+    console.error(msg)
+    process.exit(1)
+  }
+
+  if (state.stallAgentPromptForName && state.stallAgentPromptForName[target]) {
+    delete state.stallAgentPromptForName[target]
+    saveState()
+    console.error('agent_prompt_stalled: prompt submission did not observe a state change within 5000ms')
+    process.exit(1)
+  }
+
+  const agent = state.agents.find((a) => a.name === target)
+  if (!agent) {
+    console.error('agent not found: ' + target)
+    process.exit(1)
+  }
+
+  if (!agent.prompts) {
+    agent.prompts = []
+  }
+  agent.prompts.push(text)
+
+  let wait = false
+  const until = []
+  let timeout = undefined
+
+  for (let i = 4; i < args.length; i++) {
+    if (args[i] === '--wait') {
+      wait = true
+    } else if (args[i] === '--until' && args[i + 1]) {
+      until.push(args[++i])
+    } else if (args[i] === '--timeout' && args[i + 1]) {
+      timeout = parseInt(args[++i], 10)
+    }
+  }
+
+  if (state.blockAgentOnPrompt && state.blockAgentOnPrompt[target]) {
+    agent.agent_status = 'blocked'
+    saveState()
+
+    const unblockFile = state.blockAgentOnPrompt[target].unblockFile
+    if (unblockFile) {
+      while (!fs.existsSync(unblockFile)) {
+        const curState = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+        const curAgent = curState.agents && curState.agents.find((a) => a.name === target)
+        if (curAgent && curAgent.agent_status !== 'blocked') {
+          break
+        }
+        const waitUntil = Date.now() + 20
+        while (Date.now() < waitUntil) {}
+      }
+    }
+    agent.agent_status = 'idle'
+    saveState()
+  } else {
+    agent.agent_status = 'idle'
+    saveState()
+  }
+
+  console.log(JSON.stringify({
+    id: 'req-agent-prompt',
+    result: {
+      type: 'agent_prompted',
+      agent
+    }
+  }))
+  process.exit(0)
+}
+
+// Subcommand: herdr agent wait <TARGET> [OPTIONS]
+if (args[0] === 'agent' && args[1] === 'wait') {
+  const target = args[2]
+  const agent = state.agents.find((a) => a.name === target)
+  if (!agent) {
+    console.error('agent not found: ' + target)
+    process.exit(1)
+  }
+  console.log(JSON.stringify({
+    id: 'req-agent-wait',
+    result: {
+      type: 'wait_matched',
+      event: {
+        agent_name: target,
+        status: agent.agent_status
+      }
     }
   }))
   process.exit(0)
@@ -828,8 +947,9 @@ export default async function (drovr: Drovr) {
 
     await rm(dir, { recursive: true, force: true })
   })
-
-  it('returns a Worker handle whose prompt method throws not implemented', async () => {
+})
+describe('Issue #31: Worker prompts remain sequential and visible', () => {
+  it('sends prompt text through Herdr, waits without Drovr timeout for idle or done, and returns no transcript', async () => {
     const dir = await initRepo()
     const { binDir, statePath } = await setupMockHerdr(dir)
 
@@ -838,23 +958,18 @@ export default async function (drovr: Drovr) {
       join(dir, '.drovr/main.ts'),
       `import type { Drovr } from 'drovr'
 export default async function (drovr: Drovr) {
-  const wt = await drovr.worktree({ name: 'worker-prompt' })
-  const worker = await drovr.start({ name: 'worker-prompt', cwd: wt.path })
-  try {
-    await worker.prompt('hello')
-    throw new Error('should not succeed')
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err)
-    if (!msg.includes('prompt is not implemented yet')) {
-      throw err
-    }
+  const wt = await drovr.worktree({ name: 'worker-prompt-single' })
+  const worker = await drovr.start({ name: 'worker-prompt-single', cwd: wt.path })
+  const res = await worker.prompt('Implement issue #42')
+  if (res !== undefined) {
+    throw new Error('Expected prompt to return undefined (no transcript), got: ' + JSON.stringify(res))
   }
 }
 `,
       'utf8',
     )
 
-    const output = execFileSync(process.execPath, [drovr, 'start'], {
+    execFileSync(process.execPath, [drovr, 'start'], {
       cwd: dir,
       encoding: 'utf8',
       env: {
@@ -864,7 +979,299 @@ export default async function (drovr: Drovr) {
       },
     })
 
-    expect(output).toBeDefined()
+    const agent = getHerdrAgent(binDir, statePath, 'worker-prompt-single')
+    expect(agent).toBeDefined()
+    expect(agent?.prompts).toEqual(['Implement issue #42'])
+    expect(agent?.agent_status).toBe('idle')
+
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('completes two sequential prompts on one Worker in order and returns no transcript', async () => {
+    const dir = await initRepo()
+    const { binDir, statePath } = await setupMockHerdr(dir)
+
+    await mkdir(join(dir, '.drovr'), { recursive: true })
+    await writeFile(
+      join(dir, '.drovr/main.ts'),
+      `import type { Drovr } from 'drovr'
+export default async function (drovr: Drovr) {
+  const wt = await drovr.worktree({ name: 'worker-seq' })
+  const worker = await drovr.start({ name: 'worker-seq', cwd: wt.path })
+  const res1 = await worker.prompt('turn 1: initial changes')
+  const res2 = await worker.prompt('turn 2: follow-up tests')
+  if (res1 !== undefined || res2 !== undefined) {
+    throw new Error('Expected no transcript, got res1=' + res1 + ' res2=' + res2)
+  }
+}
+`,
+      'utf8',
+    )
+
+    execFileSync(process.execPath, [drovr, 'start'], {
+      cwd: dir,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH}`,
+        HERDR_STATE_FILE: statePath,
+      },
+    })
+
+    const agent = getHerdrAgent(binDir, statePath, 'worker-seq')
+    expect(agent).toBeDefined()
+    expect(agent?.prompts).toEqual(['turn 1: initial changes', 'turn 2: follow-up tests'])
+    expect(agent?.agent_status).toBe('idle')
+
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('rejects a second overlapping prompt on the same Name without double-submitting', async () => {
+    const dir = await initRepo()
+    const { binDir, statePath } = await setupMockHerdr(dir)
+
+    await mkdir(join(dir, '.drovr'), { recursive: true })
+    await writeFile(
+      join(dir, '.drovr/main.ts'),
+      `import type { Drovr } from 'drovr'
+export default async function (drovr: Drovr) {
+  const wt = await drovr.worktree({ name: 'worker-overlap' })
+  const worker = await drovr.start({ name: 'worker-overlap', cwd: wt.path })
+
+  const results = await Promise.allSettled([
+    worker.prompt('prompt 1'),
+    worker.prompt('prompt 2'),
+  ])
+
+  const fulfilled = results.filter((r) => r.status === 'fulfilled')
+  const rejected = results.filter((r) => r.status === 'rejected')
+
+  if (fulfilled.length !== 1 || rejected.length !== 1) {
+    throw new Error('Expected exactly 1 fulfilled and 1 rejected prompt, got: ' + JSON.stringify(results))
+  }
+
+  const reason = (rejected[0] as PromiseRejectedResult).reason
+  const msg = reason instanceof Error ? reason.message : String(reason)
+  if (!msg.toLowerCase().includes('already') && !msg.toLowerCase().includes('overlap') && !msg.toLowerCase().includes('progress')) {
+    throw new Error('Expected overlapping prompt error, got: ' + msg)
+  }
+
+  // Subsequent sequential prompt should now succeed (prompt lock is freed)
+  await worker.prompt('prompt 3 sequential')
+}
+`,
+      'utf8',
+    )
+
+    execFileSync(process.execPath, [drovr, 'start'], {
+      cwd: dir,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH}`,
+        HERDR_STATE_FILE: statePath,
+      },
+    })
+
+    const agent = getHerdrAgent(binDir, statePath, 'worker-overlap')
+    expect(agent).toBeDefined()
+    // Exactly prompt 1 and prompt 3 reached Herdr; prompt 2 was rejected before submission
+    expect(agent?.prompts).toEqual(['prompt 1', 'prompt 3 sequential'])
+
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('releases sequential prompt lock on terminal failure so subsequent prompt can run', async () => {
+    const dir = await initRepo()
+    const { binDir, statePath } = await setupMockHerdr(dir, {
+      failNextAgentPrompt: 'Simulated Herdr socket failure on first prompt',
+    })
+
+    await mkdir(join(dir, '.drovr'), { recursive: true })
+    await writeFile(
+      join(dir, '.drovr/main.ts'),
+      `import type { Drovr } from 'drovr'
+export default async function (drovr: Drovr) {
+  const wt = await drovr.worktree({ name: 'worker-err-lock' })
+  const worker = await drovr.start({ name: 'worker-err-lock', cwd: wt.path })
+
+  try {
+    await worker.prompt('failing prompt')
+    throw new Error('should have failed')
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err)
+    if (!msg.includes('Simulated Herdr socket failure')) {
+      throw err
+    }
+  }
+
+  // After prompt failure, lock must be released so next prompt can run
+  await worker.prompt('recovered prompt')
+}
+`,
+      'utf8',
+    )
+
+    execFileSync(process.execPath, [drovr, 'start'], {
+      cwd: dir,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH}`,
+        HERDR_STATE_FILE: statePath,
+      },
+    })
+
+    const agent = getHerdrAgent(binDir, statePath, 'worker-err-lock')
+    expect(agent).toBeDefined()
+    expect(agent?.prompts).toEqual(['recovered prompt'])
+
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('fails map item on stalled prompt without automatic retry', async () => {
+    const dir = await initRepo()
+    const { binDir, statePath } = await setupMockHerdr(dir, {
+      stallAgentPromptForName: {
+        'worker-stall': true,
+      },
+    })
+
+    await mkdir(join(dir, '.drovr'), { recursive: true })
+    await writeFile(
+      join(dir, '.drovr/main.ts'),
+      `import type { Drovr } from 'drovr'
+export default async function (drovr: Drovr) {
+  const wt = await drovr.worktree({ name: 'worker-stall' })
+  const worker = await drovr.start({ name: 'worker-stall', cwd: wt.path })
+  await worker.prompt('stalling prompt')
+}
+`,
+      'utf8',
+    )
+
+    let caughtError: unknown
+    try {
+      execFileSync(process.execPath, [drovr, 'start'], {
+        cwd: dir,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          HERDR_STATE_FILE: statePath,
+        },
+      })
+    } catch (err: unknown) {
+      caughtError = err
+    }
+
+    const errInfo = extractExecError(caughtError)
+    expect(errInfo.status).toBe(1)
+    expect(errInfo.stderr).toContain('agent_prompt_stalled')
+
+    const agent = getHerdrAgent(binDir, statePath, 'worker-stall')
+    expect(agent).toBeDefined()
+    // Exactly 1 attempt made; no automatic retry occurred
+    expect(agent?.prompts).toBeUndefined()
+
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('keeps waiting during blocked state without counting it as success until idle transition follows', async () => {
+    const dir = await initRepo()
+    const unblockFile = join(dir, 'unblock.signal')
+    const { binDir, statePath } = await setupMockHerdr(dir, {
+      blockAgentOnPrompt: {
+        'worker-blocked': { unblockFile },
+      },
+    })
+
+    await mkdir(join(dir, '.drovr'), { recursive: true })
+    await writeFile(
+      join(dir, '.drovr/main.ts'),
+      `import type { Drovr } from 'drovr'
+import { writeFile } from 'node:fs/promises'
+export default async function (drovr: Drovr) {
+  const wt = await drovr.worktree({ name: 'worker-blocked' })
+  const worker = await drovr.start({ name: 'worker-blocked', cwd: wt.path })
+
+  const unblockTask = (async () => {
+    await Promise.resolve()
+    await writeFile(${JSON.stringify(unblockFile)}, 'ok', 'utf8')
+  })()
+  await worker.prompt('action requiring human approval')
+  await unblockTask
+}
+`,
+      'utf8',
+    )
+
+    execFileSync(process.execPath, [drovr, 'start'], {
+      cwd: dir,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH}`,
+        HERDR_STATE_FILE: statePath,
+      },
+    })
+
+    const agent = getHerdrAgent(binDir, statePath, 'worker-blocked')
+    expect(agent).toBeDefined()
+    expect(agent?.prompts).toEqual(['action requiring human approval'])
+    expect(agent?.agent_status).toBe('idle')
+
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('excludes prompt bodies and Herdr subprocess output from Drovr log events even on errors', async () => {
+    const dir = await initRepo()
+    const secretPromptSuccess = 'SECRET_PAYLOAD_SUCCESS_XYZ_777'
+    const secretPromptFail = 'SECRET_PAYLOAD_FAIL_ABC_888'
+    const { binDir, statePath } = await setupMockHerdr(dir, {
+      stallAgentPromptForName: {
+        'worker-log-fail': true,
+      },
+    })
+
+    await mkdir(join(dir, '.drovr'), { recursive: true })
+    await writeFile(
+      join(dir, '.drovr/main.ts'),
+      `import type { Drovr } from 'drovr'
+export default async function (drovr: Drovr) {
+  const items = [
+    { name: 'worker-log-ok', prompt: ${JSON.stringify(secretPromptSuccess)} },
+    { name: 'worker-log-fail', prompt: ${JSON.stringify(secretPromptFail)} },
+  ]
+
+  await drovr.map(items, { concurrency: 2, name: (i) => i.name }, async (item) => {
+    const wt = await drovr.worktree({ name: item.name })
+    const worker = await drovr.start({ name: item.name, cwd: wt.path })
+    await worker.prompt(item.prompt)
+  })
+}
+`,
+      'utf8',
+    )
+
+    try {
+      execFileSync(process.execPath, [drovr, 'start'], {
+        cwd: dir,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          HERDR_STATE_FILE: statePath,
+        },
+      })
+    } catch {}
+
+    const logContent = await readFile(join(dir, '.drovr/drovr.log'), 'utf8')
+    expect(logContent).not.toContain(secretPromptSuccess)
+    expect(logContent).not.toContain(secretPromptFail)
+    expect(logContent).not.toContain('req-agent-prompt')
+    expect(logContent).not.toContain('agent_prompted')
+
     await rm(dir, { recursive: true, force: true })
   })
 })

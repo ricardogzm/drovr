@@ -1,4 +1,7 @@
-import { execFileSync } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
+import { promisify } from 'node:util'
+
+const execFileAsync = promisify(execFile)
 import type { Name } from './index'
 
 export interface HerdrWorkspaceResult {
@@ -15,6 +18,7 @@ export function runHerdr(cwd: string, args: string[]): string {
       stdio: ['pipe', 'pipe', 'pipe'],
     }).trimEnd()
   } catch (error: unknown) {
+    const commandName = `herdr ${args.slice(0, 2).join(' ')}`
     if (typeof error === 'object' && error !== null && 'stderr' in error) {
       const stderr =
         typeof error.stderr === 'string'
@@ -23,10 +27,10 @@ export function runHerdr(cwd: string, args: string[]): string {
             ? error.stderr.toString('utf8').trim()
             : ''
       if (stderr) {
-        throw new Error(`herdr ${args.slice(0, 2).join(' ')} failed: ${stderr}`)
+        throw new Error(`${commandName} failed: ${stderr}`)
       }
     }
-    throw error
+    throw new Error(`${commandName} failed`)
   }
 }
 
@@ -98,4 +102,46 @@ export function startHerdrOmpWorker(
   options: { name: Name; paneId: string },
 ): void {
   runHerdr(commandCwd, ['agent', 'start', options.name, '--kind', 'omp', '--pane', options.paneId])
+}
+
+export async function runHerdrAsync(cwd: string, args: string[]): Promise<string> {
+  const commandName = `herdr ${args.slice(0, 2).join(' ')}`
+  try {
+    const { stdout } = await execFileAsync('herdr', args, {
+      cwd,
+      encoding: 'utf8',
+      env: process.env,
+    })
+    return stdout.trimEnd()
+  } catch (error: unknown) {
+    if (typeof error === 'object' && error !== null && 'stderr' in error) {
+      const stderr =
+        typeof error.stderr === 'string'
+          ? error.stderr.trim()
+          : error.stderr instanceof Buffer
+            ? error.stderr.toString('utf8').trim()
+            : ''
+      if (stderr) {
+        throw new Error(`${commandName} failed: ${stderr}`)
+      }
+    }
+    throw new Error(`${commandName} failed`)
+  }
+}
+
+export async function promptHerdrOmpWorker(
+  commandCwd: string,
+  options: { name: Name; text: string },
+): Promise<void> {
+  await runHerdrAsync(commandCwd, [
+    'agent',
+    'prompt',
+    options.name,
+    options.text,
+    '--wait',
+    '--until',
+    'idle',
+    '--until',
+    'done',
+  ])
 }
