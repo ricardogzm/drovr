@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events'
 import { lstat, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
@@ -30,7 +31,7 @@ import {
   startHerdrOmpWorker,
   waitHerdrOmpWorker,
 } from './herdr'
-import type { Drovr, Issue, Name, Worker, Worktree } from './index'
+import type { Drovr, Issue, Name, Resource, Worker, Worktree } from './index'
 import type { DrovrLogger, DrovrLoggerCounts } from './log'
 import { mergeExactLine } from './merge-line'
 
@@ -53,9 +54,191 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
   const { db, logger, counts, root, cwd, mode = 'fresh' } = context
   const workingDir = root ?? cwd ?? process.cwd()
   const activePrompts = new Set<Name>()
+  const activeLeaseCounts = new Map<string, number>()
+  const resourceReleaseNotifier = new EventEmitter()
+  resourceReleaseNotifier.setMaxListeners(0)
+
+  async function waitForResourceLease(resourceName: string): Promise<void> {
+    await new Promise<void>((resolve) => {
+      let timer: NodeJS.Timeout | undefined
+      const onRelease = () => {
+        cleanup()
+        resolve()
+      }
+      const cleanup = () => {
+        clearTimeout(timer)
+        resourceReleaseNotifier.removeListener(`release:${resourceName}`, onRelease)
+      }
+      resourceReleaseNotifier.once(`release:${resourceName}`, onRelease)
+      timer = setTimeout(() => {
+        cleanup()
+        resolve()
+      }, 25)
+    })
+  }
+
   return {
-    async resource() {
-      throw new Error('resource is not implemented yet')
+    async resource(
+      name: string,
+      spec:
+        | { capacity: number }
+        | {
+            ports: number | readonly number[] | { from: number; to: number }
+          },
+    ): Promise<Resource> {
+      if (typeof name !== 'string' || name.length === 0) {
+        throw new TypeError('resource name must be a non-empty string')
+      }
+      if (typeof spec !== 'object' || spec === null) {
+        throw new TypeError('resource spec must be an object')
+      }
+      if ('capacity' in spec && 'ports' in spec) {
+        throw new TypeError('resource spec cannot contain both capacity and ports')
+      }
+      if (!('capacity' in spec) && !('ports' in spec)) {
+        throw new TypeError('resource spec must declare capacity or ports')
+      }
+
+      if ('capacity' in spec) {
+        const capacity = spec.capacity
+        if (typeof capacity !== 'number' || !Number.isInteger(capacity) || capacity < 1) {
+          throw new TypeError('resource capacity must be a positive integer')
+        }
+
+        if (db) {
+          const existing = db
+            .prepare('SELECT type, capacity FROM resources WHERE name = ?')
+            .get(name) as { type: string; capacity: number } | undefined
+
+          if (existing !== undefined) {
+            const occupancyRow = db
+              .prepare('SELECT COUNT(*) as count FROM leases WHERE resource_name = ?')
+              .get(name) as { count: number }
+            const occupancy = occupancyRow.count
+            if (capacity < occupancy) {
+              throw new Error(
+                `cannot reduce capacity of resource "${name}" from ${existing.capacity} to ${capacity} below live occupancy of ${occupancy}`,
+              )
+            }
+            db.prepare('UPDATE resources SET type = ?, capacity = ? WHERE name = ?').run(
+              'capacity',
+              capacity,
+              name,
+            )
+          } else {
+            db.prepare('INSERT INTO resources (name, type, capacity) VALUES (?, ?, ?)').run(
+              name,
+              'capacity',
+              capacity,
+            )
+          }
+        }
+      }
+
+      return {
+        async lease<T>(opts: { name: Name }, fn: () => Promise<T>): Promise<T> {
+          if (typeof opts !== 'object' || opts === null) {
+            throw new TypeError('lease options must be an object')
+          }
+          if (!isValidName(opts.name)) {
+            throw new TypeError(
+              `Invalid name: "${String(opts.name)}". Names must match [a-z][a-z0-9_-]{0,31}`,
+            )
+          }
+          if (typeof fn !== 'function') {
+            throw new TypeError('lease callback must be a function')
+          }
+
+          logger?.resourceLeaseRequest(name, opts.name)
+
+          const leaseKey = `${name}:${opts.name}`
+          let hasWaited = false
+
+          while (true) {
+            let acquired = false
+
+            if (db) {
+              db.exec('BEGIN IMMEDIATE;')
+              try {
+                const existingLease = db
+                  .prepare('SELECT 1 FROM leases WHERE resource_name = ? AND name = ?')
+                  .get(name, opts.name)
+
+                if (existingLease !== undefined) {
+                  acquired = true
+                  db.exec('COMMIT;')
+                } else {
+                  const resRow = db
+                    .prepare('SELECT capacity FROM resources WHERE name = ?')
+                    .get(name) as { capacity: number } | undefined
+
+                  if (!resRow) {
+                    db.exec('ROLLBACK;')
+                    throw new Error(`resource "${name}" not found in database`)
+                  }
+
+                  const occupancyRow = db
+                    .prepare('SELECT COUNT(*) as count FROM leases WHERE resource_name = ?')
+                    .get(name) as { count: number }
+
+                  if (occupancyRow.count < resRow.capacity) {
+                    db.prepare('INSERT INTO leases (resource_name, name) VALUES (?, ?)').run(
+                      name,
+                      opts.name,
+                    )
+                    acquired = true
+                    db.exec('COMMIT;')
+                  } else {
+                    db.exec('COMMIT;')
+                  }
+                }
+              } catch (err) {
+                try {
+                  db.exec('ROLLBACK;')
+                } catch {}
+                throw err
+              }
+            } else {
+              acquired = true
+            }
+
+            if (acquired) {
+              activeLeaseCounts.set(leaseKey, (activeLeaseCounts.get(leaseKey) ?? 0) + 1)
+              break
+            }
+
+            if (!hasWaited) {
+              hasWaited = true
+              logger?.resourceLeaseWait(name, opts.name)
+            }
+
+            await waitForResourceLease(name)
+          }
+
+          logger?.resourceLeaseAcquire(name, opts.name)
+
+          try {
+            return await fn()
+          } finally {
+            const remaining = (activeLeaseCounts.get(leaseKey) ?? 1) - 1
+            if (remaining <= 0) {
+              activeLeaseCounts.delete(leaseKey)
+              if (db) {
+                try {
+                  db.prepare('DELETE FROM leases WHERE resource_name = ? AND name = ?').run(
+                    name,
+                    opts.name,
+                  )
+                } catch {}
+              }
+              resourceReleaseNotifier.emit(`release:${name}`)
+              resourceReleaseNotifier.emit('release', name)
+            } else {
+              activeLeaseCounts.set(leaseKey, remaining)
+            }
+          }
+        },
+      }
     },
     async map<T>(
       items: readonly T[],

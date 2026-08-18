@@ -21,6 +21,9 @@ export interface DrovrLogger {
   mapItemSkip(name: string): void
   mapItemComplete(name: string): void
   mapItemFail(name: string, error?: unknown): void
+  resourceLeaseRequest(resource: string, name: string): void
+  resourceLeaseWait(resource: string, name: string): void
+  resourceLeaseAcquire(resource: string, name: string): void
   close(): Promise<void>
 }
 
@@ -180,6 +183,15 @@ export function createDrovrLogger(options: DrovrLoggerOptions): DrovrLogger {
     mapItemFail(name: string, error?: unknown) {
       const errMessage = formatErrorMessage(error)
       logger.error(`map.item.fail name=${name} error=${JSON.stringify(errMessage)}`)
+    },
+    resourceLeaseRequest(resource: string, name: string) {
+      logger.info(`resource.lease.request resource=${resource} name=${name}`)
+    },
+    resourceLeaseWait(resource: string, name: string) {
+      logger.info(`resource.lease.wait resource=${resource} name=${name}`)
+    },
+    resourceLeaseAcquire(resource: string, name: string) {
+      logger.info(`resource.lease.acquire resource=${resource} name=${name}`)
     },
     async close(): Promise<void> {
       await new Promise<void>((resolve) => {
