@@ -69,6 +69,8 @@ export function listReadyIssues(cwd: string, repo: string): RawGhIssue[] {
     'open',
     '--label',
     'ready-for-agent',
+    '--limit',
+    '1000',
     '--json',
     ISSUE_JSON_FIELDS,
     '-R',

@@ -101,7 +101,13 @@ if (args[0] === 'issue' && args[1] === 'list') {
     }
     return true
   })
-  console.log(JSON.stringify(issues))
+  let limit = 30
+  const limitIndex = args.indexOf('--limit') !== -1 ? args.indexOf('--limit') : args.indexOf('-L')
+  if (limitIndex !== -1 && args[limitIndex + 1]) {
+    limit = parseInt(args[limitIndex + 1], 10)
+  }
+  const sliced = issues.slice(0, limit)
+  console.log(JSON.stringify(sliced))
   process.exit(0)
 }
 
@@ -548,6 +554,137 @@ export default async function (drovr) {
           stdio: 'pipe',
         }),
       ).toThrow(/must be in owner\/repo form/)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('fetches more than the gh default 30 issues when explicit limit is used', async () => {
+    const repo = await initRepo()
+    try {
+      const issuesList = []
+      for (let i = 1; i <= 35; i++) {
+        issuesList.push({
+          repo: 'acme/widget',
+          number: i,
+          title: `Issue ${i}`,
+          body: `Body ${i}`,
+          url: `https://github.com/acme/widget/issues/${i}`,
+          state: 'OPEN' as const,
+          labels: [{ name: 'ready-for-agent' }],
+          assignees: [],
+          author: { login: 'alice' },
+          createdAt: '2026-08-18T00:00:00Z',
+          updatedAt: '2026-08-18T01:00:00Z',
+        })
+      }
+
+      const { binDir, statePath } = await setupMockGh(repo, {
+        defaultRepo: 'acme/widget',
+        currentUser: 'drovr-bot',
+        issues: issuesList,
+      })
+
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import { writeFile } from 'node:fs/promises'
+export default async function (drovr) {
+  const issues = await drovr.issues.list()
+  await writeFile('result.json', JSON.stringify({ count: issues.length }), 'utf8')
+}
+`,
+        'utf8',
+      )
+
+      execFileSync('node', [drovr, 'start'], {
+        cwd: repo,
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          GH_STATE_FILE: statePath,
+        },
+      })
+
+      const result = JSON.parse(await readFile(join(repo, 'result.json'), 'utf8'))
+      expect(result.count).toBe(35)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('returns open locally Claimed issues even if ready-for-agent label was removed out-of-band', async () => {
+    const repo = await initRepo()
+    try {
+      const { binDir, statePath } = await setupMockGh(repo, {
+        defaultRepo: 'acme/widget',
+        currentUser: 'drovr-bot',
+        issues: [
+          {
+            repo: 'acme/widget',
+            number: 350,
+            title: 'Issue whose label will be removed',
+            body: 'Body 350',
+            url: 'https://github.com/acme/widget/issues/350',
+            state: 'OPEN',
+            labels: [{ name: 'ready-for-agent' }],
+            assignees: [],
+            author: { login: 'alice' },
+            createdAt: '2026-08-18T00:00:00Z',
+            updatedAt: '2026-08-18T01:00:00Z',
+          },
+        ],
+      })
+
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      // First pass: claim issue 350 for name 'agent-owner'
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `export default async function (drovr) {
+  const issues = await drovr.issues.list()
+  await drovr.issues.claim(issues[0], { name: 'agent-owner' })
+}
+`,
+        'utf8',
+      )
+
+      execFileSync('node', [drovr, 'start'], {
+        cwd: repo,
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          GH_STATE_FILE: statePath,
+        },
+      })
+
+      // Out-of-band edit on GitHub removes ready-for-agent label (leaving only 'in-progress')
+      const ghState = JSON.parse(await readFile(statePath, 'utf8'))
+      ghState.issues[0].labels = [{ name: 'in-progress' }]
+      await writeFile(statePath, JSON.stringify(ghState, null, 2), 'utf8')
+
+      // Second pass: list issues should still return 350 because it is open and locally Claimed
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import { writeFile } from 'node:fs/promises'
+export default async function (drovr) {
+  const issues = await drovr.issues.list()
+  await writeFile('result.json', JSON.stringify(issues.map((i) => i.number)), 'utf8')
+}
+`,
+        'utf8',
+      )
+
+      execFileSync('node', [drovr, 'start'], {
+        cwd: repo,
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          GH_STATE_FILE: statePath,
+        },
+      })
+
+      const numbers = JSON.parse(await readFile(join(repo, 'result.json'), 'utf8'))
+      expect(numbers).toEqual([350])
     } finally {
       await rm(repo, { recursive: true, force: true })
     }

@@ -241,14 +241,7 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
                     claimed.issue_number,
                   )
                 } else if (raw.state === 'OPEN') {
-                  const hasReadyLabel =
-                    Array.isArray(raw.labels) &&
-                    raw.labels.some(
-                      (l) => (typeof l === 'string' ? l : l?.name) === 'ready-for-agent',
-                    )
-                  if (hasReadyLabel) {
-                    resultIssues.push(normalizeIssue(raw, targetRepo))
-                  }
+                  resultIssues.push(normalizeIssue(raw, targetRepo))
                 }
               }
             }
@@ -302,12 +295,15 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
               const raced = db
                 .prepare('SELECT name FROM claims WHERE repo = ? AND issue_number = ?')
                 .get(issue.repo, issue.number) as { name: string } | undefined
-              if (raced && raced.name !== opts.name) {
-                throw new Error(
-                  `Issue #${issue.number} in ${issue.repo} is already claimed by ${raced.name}`,
-                )
+              if (raced) {
+                if (raced.name !== opts.name) {
+                  throw new Error(
+                    `Issue #${issue.number} in ${issue.repo} is already claimed by ${raced.name}`,
+                  )
+                }
+              } else {
+                throw err
               }
-              throw err
             }
           }
         }
