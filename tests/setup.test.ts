@@ -38,7 +38,9 @@ describe('drovr setup', () => {
       expect(workflow).toBe(
         'import type { Drovr } from "drovr"\n\nexport default async function workflow(_drovr: Drovr): Promise<void> {}\n',
       )
-      expect(await readFile(join(repo, '.drovr/.gitignore'), 'utf8')).toBe('state.sqlite*\n')
+      expect(await readFile(join(repo, '.drovr/.gitignore'), 'utf8')).toBe(
+        'state.sqlite*\ndrovr.log\n',
+      )
 
       const gitDir = runGit(repo, ['rev-parse', '--git-dir'])
       const exclude = await readFile(join(repo, gitDir, 'info/exclude'), 'utf8')
@@ -64,7 +66,7 @@ describe('drovr setup', () => {
     }
   })
 
-  it('succeeds from a linked worktree', async () => {
+  it('succeeds from a linked worktree and writes exclude to the common git directory', async () => {
     const main = await initRepo()
     const linked = join(main, 'linked-checkout')
     runGit(main, ['worktree', 'add', linked, '-b', 'feature/linked'])
@@ -73,6 +75,15 @@ describe('drovr setup', () => {
       execFileSync('node', [drovr, 'setup'], { cwd: linked, stdio: 'pipe' })
       expect(await readFile(join(linked, '.drovr/main.ts'), 'utf8')).toContain(
         'import type { Drovr }',
+      )
+
+      const commonExclude = await readFile(join(main, '.git/info/exclude'), 'utf8')
+      expect(commonExclude).toContain('/.worktrees/')
+
+      const worktreeGitDir = runGit(linked, ['rev-parse', '--git-dir'])
+      expect(worktreeGitDir).not.toBe(join(main, '.git'))
+      await expect(readFile(join(linked, worktreeGitDir, 'info/exclude'), 'utf8')).rejects.toThrow(
+        /ENOENT/,
       )
     } finally {
       runGit(main, ['worktree', 'remove', '--force', linked])
@@ -92,7 +103,9 @@ describe('drovr setup', () => {
     try {
       execFileSync('node', [drovr, 'setup'], { cwd: repo, stdio: 'pipe' })
 
-      expect(await readFile(join(repo, '.drovr/.gitignore'), 'utf8')).toBe('notes\nstate.sqlite*\n')
+      expect(await readFile(join(repo, '.drovr/.gitignore'), 'utf8')).toBe(
+        'notes\nstate.sqlite*\ndrovr.log\n',
+      )
       expect(await readFile(join(repo, gitDir, 'info/exclude'), 'utf8')).toBe(
         'local-only\n/.worktrees/\n',
       )

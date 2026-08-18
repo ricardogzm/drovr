@@ -91,10 +91,22 @@ export type Drovr = {
    * Define a named Resource before leasing.
    *
    * Capacity Resources require an integer capacity of at least one. Port Resources
-   * use a separate declaration shape in later runtime versions; re-definition may
-   * not reduce capacity below live occupancy.
+   * declare one port, a nonempty unique readonly list, or an inclusive range and
+   * have implicit capacity one. A spec cannot contain both `capacity` and `ports`.
+   * Ports are integers from 1 through 65535; Drovr validates immediately and does
+   * not repair malformed, duplicate, reversed, or mixed declarations. A Port
+   * Resource reserves its entire normalized port set with cross-Resource exclusion
+   * by numeric port; it does not allocate ports or guarantee operating-system
+   * availability. Re-definition may not reduce capacity below live occupancy.
    */
-  resource(name: string, spec: { capacity: number }): Promise<Resource>
+  resource(
+    name: string,
+    spec:
+      | { capacity: number }
+      | {
+          ports: number | readonly number[] | { from: number; to: number }
+        },
+  ): Promise<Resource>
 
   /**
    * Run `fn` for each item with bounded concurrency.

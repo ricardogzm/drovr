@@ -20,3 +20,8 @@ export function resolveGitDir(cwd: string): string {
   const gitDir = runGit(cwd, ['rev-parse', '--git-dir'])
   return gitDir.startsWith('/') ? gitDir : `${cwd}/${gitDir}`
 }
+
+export function resolveGitCommonDir(cwd: string): string {
+  const gitCommonDir = runGit(cwd, ['rev-parse', '--git-common-dir'])
+  return gitCommonDir.startsWith('/') ? gitCommonDir : `${cwd}/${gitCommonDir}`
+}
