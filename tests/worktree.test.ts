@@ -1321,4 +1321,67 @@ export default async function workflow(drovr: Drovr): Promise<void> {
       await rm(repo, { recursive: true, force: true })
     }
   })
+
+  it('recreates missing Worktree on surviving branch when .worktrees is a symlink to an external directory without touching unrelated records', async () => {
+    const parent = await mkdtemp(join(tmpdir(), 'drovr-symlink-parent-'))
+    const externalWorktrees = join(parent, 'real-worktrees')
+    const repo = join(parent, 'repo')
+
+    try {
+      await mkdir(externalWorktrees, { recursive: true })
+      await mkdir(repo, { recursive: true })
+      runGit(repo, ['init', '-b', 'main'])
+      runGit(repo, ['config', 'user.email', 'test@example.com'])
+      runGit(repo, ['config', 'user.name', 'Test User'])
+      await writeFile(join(repo, 'README.md'), '# test\n', 'utf8')
+      runGit(repo, ['add', 'README.md'])
+      runGit(repo, ['commit', '-m', 'init'])
+
+      // Symlink .worktrees in repo to externalWorktrees
+      await symlink(externalWorktrees, join(repo, '.worktrees'))
+
+      // Also create an unrelated prunable worktree to verify it is NOT touched
+      const unrelatedPath = join(repo, '.worktrees', 'unrelated-symlink-item')
+      runGit(repo, ['worktree', 'add', '-b', 'drovr/unrelated-symlink-item', unrelatedPath, 'HEAD'])
+      await rm(unrelatedPath, { recursive: true, force: true })
+
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+
+export default async function workflow(drovr: Drovr): Promise<void> {
+  const wt = await drovr.worktree({ name: 'symlink-item' })
+  const { writeFile } = await import('node:fs/promises')
+  const { join } = await import('node:path')
+  await writeFile(join(wt.path, 'result.txt'), 'symlink-ok\\n', 'utf8')
+}
+`,
+        'utf8',
+      )
+
+      // Pass 1: fresh start creates worktree inside symlinked .worktrees
+      execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })
+
+      const physicalWorktreePath = join(externalWorktrees, 'symlink-item')
+      expect(existsSync(physicalWorktreePath)).toBe(true)
+
+      // Remove the child directory to simulate crash/loss
+      await rm(physicalWorktreePath, { recursive: true, force: true })
+      expect(existsSync(physicalWorktreePath)).toBe(false)
+
+      // Pass 2: resume recreates worktree from surviving branch through symlinked .worktrees
+      execFileSync('node', [drovr, 'start', '--resume'], { cwd: repo, stdio: 'pipe' })
+
+      expect(existsSync(physicalWorktreePath)).toBe(true)
+      expect(await readFile(join(physicalWorktreePath, 'result.txt'), 'utf8')).toBe('symlink-ok\n')
+
+      // Verify unrelated prunable registration was untouched
+      const rawList = runGit(repo, ['worktree', 'list', '--porcelain'])
+      expect(rawList).toContain('unrelated-symlink-item')
+      expect(rawList).toContain('prunable')
+    } finally {
+      await rm(parent, { recursive: true, force: true })
+    }
+  })
 })

@@ -221,11 +221,12 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
           isEnoent(err) ? null : Promise.reject(err),
         )
         const pathExists = pathStat !== null
+        const canonicalWorktreePath = safeRealpath(worktreePath)
 
         const worktrees = listGitWorktrees(workingDir)
         const matchingBranchEntries = worktrees.filter((w) => w.branch === fullBranchRef)
         const branchElsewhere = matchingBranchEntries.filter(
-          (w) => safeRealpath(w.path) !== safeRealpath(worktreePath),
+          (w) => safeRealpath(w.path) !== canonicalWorktreePath,
         )
         if (branchElsewhere.length > 0) {
           throw new Error(
@@ -234,7 +235,7 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
         }
 
         const matchingPathEntries = worktrees.filter(
-          (w) => safeRealpath(w.path) === safeRealpath(worktreePath),
+          (w) => safeRealpath(w.path) === canonicalWorktreePath,
         )
 
         if (pathExists) {

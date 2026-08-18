@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process'
 import { realpathSync } from 'node:fs'
-import { isAbsolute, join, relative, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
 export function runGit(cwd: string, args: string[]): string {
   return execFileSync('git', args, {
@@ -197,6 +197,26 @@ export function safeRealpath(p: string): string {
     return realpathSync(p)
   } catch (err) {
     if (typeof err === 'object' && err !== null && 'code' in err && err.code === 'ENOENT') {
+      let current = resolve(p)
+      const parts: string[] = []
+      while (current !== '/' && current !== dirname(current)) {
+        try {
+          const realAncestor = realpathSync(current)
+          return join(realAncestor, ...parts)
+        } catch (ancestorErr) {
+          if (
+            typeof ancestorErr === 'object' &&
+            ancestorErr !== null &&
+            'code' in ancestorErr &&
+            ancestorErr.code === 'ENOENT'
+          ) {
+            parts.unshift(basename(current))
+            current = dirname(current)
+          } else {
+            throw ancestorErr
+          }
+        }
+      }
       return resolve(p)
     }
     throw err
