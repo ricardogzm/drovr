@@ -40,6 +40,9 @@
     "prepublishOnly": "pnpm run build",
     "prepare": "husky"
   },
+  "dependencies": {
+    "winston": "^3.19.0"
+  },
   "devDependencies": {
     "@types/node": "^26.1.1",
     "bumpp": "^12.2.0",

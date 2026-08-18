@@ -5,6 +5,8 @@ import { openProjectDatabase } from './db'
 import { createDrovr } from './drovr'
 import { resolveGitWorktreeRoot } from './git'
 import { acquireCheckoutLock } from './lock'
+import { createDrovrLogger } from './log'
+import type { DrovrLoggerCounts } from './log'
 import { mergeExactLine } from './merge-line'
 
 const WORKFLOW_RELATIVE_PATH = '.drovr/main.ts'
@@ -12,7 +14,13 @@ const DROVR_GITIGNORE_RELATIVE_PATH = '.drovr/.gitignore'
 const SQLITE_IGNORE_LINE = 'state.sqlite*'
 const LOG_IGNORE_LINE = 'drovr.log'
 const LOCK_IGNORE_LINE = 'start.lock*'
-export async function runStart(cwd: string): Promise<void> {
+export interface StartOptions {
+  resume?: boolean
+  verbose?: boolean
+}
+
+export async function runStart(cwd: string, options: StartOptions = {}): Promise<void> {
+  const mode = options.resume ? 'resume' : 'fresh'
   const root = resolveGitWorktreeRoot(cwd, 'drovr start')
   const drovrDir = join(root, '.drovr')
   await mkdir(drovrDir, { recursive: true })
@@ -20,24 +28,49 @@ export async function runStart(cwd: string): Promise<void> {
   const lock = acquireCheckoutLock(join(drovrDir, 'start.lock'))
   try {
     await applyLazyHygiene(root)
-    const db = openProjectDatabase(join(drovrDir, 'state.sqlite'))
+    const logPath = join(drovrDir, 'drovr.log')
+    const logger = createDrovrLogger({ logPath, verbose: options.verbose })
+    logger.startBegin(mode)
+
+    const counts: DrovrLoggerCounts = { started: 0, skipped: 0, completed: 0, failed: 0 }
+    let runError: unknown = null
+
     try {
-      const workflowPath = join(root, WORKFLOW_RELATIVE_PATH)
-      if (!(await fileExists(workflowPath))) {
-        throw new Error('drovr start found no Workflow at .drovr/main.ts')
+      const dbPath = join(drovrDir, 'state.sqlite')
+      if (options.resume && !(await fileExists(dbPath))) {
+        throw new Error(
+          'drovr start --resume requires an existing Project database at .drovr/state.sqlite',
+        )
       }
 
-      // Dynamic import of user workflow from filesystem
-      const workflowUrl = pathToFileURL(workflowPath).href
-      const mod = await import(workflowUrl)
-      if (typeof mod.default !== 'function') {
-        throw new Error('Workflow at .drovr/main.ts must default export a function')
-      }
+      const db = openProjectDatabase(dbPath)
+      try {
+        const workflowPath = join(root, WORKFLOW_RELATIVE_PATH)
+        if (!(await fileExists(workflowPath))) {
+          throw new Error('drovr start found no Workflow at .drovr/main.ts')
+        }
 
-      const drovr = createDrovr()
-      await mod.default(drovr)
+        // Dynamic import of user workflow from filesystem (runtime-authored path)
+        const workflowUrl = pathToFileURL(workflowPath).href
+        const mod = await import(workflowUrl)
+        if (typeof mod.default !== 'function') {
+          throw new Error('Workflow at .drovr/main.ts must default export a function')
+        }
+
+        const drovr = createDrovr()
+        await mod.default(drovr)
+      } finally {
+        db.close()
+      }
+    } catch (err) {
+      runError = err
+      logger.startFail(mode, counts, err)
+      throw err
     } finally {
-      db.close()
+      if (!runError) {
+        logger.startComplete(mode, counts)
+      }
+      await logger.close()
     }
   } finally {
     lock.release()
