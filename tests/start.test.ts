@@ -55,9 +55,8 @@ describe('drovr start', () => {
       execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })
 
       expect(await readFile(join(repo, '.drovr/.gitignore'), 'utf8')).toBe(
-        'state.sqlite*\ndrovr.log\n',
+        'state.sqlite*\ndrovr.log\nstart.lock*\n',
       )
-
       const sqliteStat = await stat(join(repo, '.drovr/state.sqlite'))
       expect(sqliteStat.isFile()).toBe(true)
     } finally {
@@ -139,7 +138,7 @@ export default async function workflow(_drovr: Drovr): Promise<void> {
       execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })
 
       expect(await readFile(join(repo, '.drovr/.gitignore'), 'utf8')).toBe(
-        '# custom comment\nstate.sqlite*\nmy-file.tmp\ndrovr.log\n',
+        '# custom comment\nstate.sqlite*\nmy-file.tmp\ndrovr.log\nstart.lock*\n',
       )
     } finally {
       await rm(repo, { recursive: true, force: true })

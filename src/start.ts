@@ -11,7 +11,7 @@ const WORKFLOW_RELATIVE_PATH = '.drovr/main.ts'
 const DROVR_GITIGNORE_RELATIVE_PATH = '.drovr/.gitignore'
 const SQLITE_IGNORE_LINE = 'state.sqlite*'
 const LOG_IGNORE_LINE = 'drovr.log'
-
+const LOCK_IGNORE_LINE = 'start.lock*'
 export async function runStart(cwd: string): Promise<void> {
   const root = resolveGitWorktreeRoot(cwd, 'drovr start')
   const drovrDir = join(root, '.drovr')
@@ -49,6 +49,7 @@ async function applyLazyHygiene(root: string): Promise<void> {
   let drovrGitignore = await readTextIfExists(drovrGitignorePath)
   drovrGitignore = mergeExactLine(drovrGitignore, SQLITE_IGNORE_LINE)
   drovrGitignore = mergeExactLine(drovrGitignore, LOG_IGNORE_LINE)
+  drovrGitignore = mergeExactLine(drovrGitignore, LOCK_IGNORE_LINE)
   await writeFile(drovrGitignorePath, drovrGitignore, 'utf8')
 }
 
