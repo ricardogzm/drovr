@@ -39,7 +39,14 @@ CREATE TABLE IF NOT EXISTS worktree_setups (
 PRAGMA user_version = 1;
 `
 
-export function openProjectDatabase(dbPath: string): DatabaseSync {
+export interface OpenProjectDatabaseOptions {
+  mode?: 'fresh' | 'resume'
+}
+
+export function openProjectDatabase(
+  dbPath: string,
+  options: OpenProjectDatabaseOptions = {},
+): DatabaseSync {
   const db = new DatabaseSync(dbPath)
   db.exec('PRAGMA journal_mode = WAL;')
   db.exec('PRAGMA foreign_keys = ON;')
@@ -48,11 +55,18 @@ export function openProjectDatabase(dbPath: string): DatabaseSync {
   const userVersionRow = db.prepare('PRAGMA user_version;').get() as { user_version: number }
   const userVersion = userVersionRow.user_version
 
-  if (userVersion === 0) {
-    db.exec(V1_SCHEMA_SQL)
-  } else if (userVersion !== 1) {
-    db.close()
-    throw new Error(`unsupported database version: ${userVersion}`)
+  if (options.mode === 'resume') {
+    if (userVersion !== 1) {
+      db.close()
+      throw new Error(`unsupported database version: ${userVersion}`)
+    }
+  } else {
+    if (userVersion === 0) {
+      db.exec(V1_SCHEMA_SQL)
+    } else if (userVersion !== 1) {
+      db.close()
+      throw new Error(`unsupported database version: ${userVersion}`)
+    }
   }
 
   return db

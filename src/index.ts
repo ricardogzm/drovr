@@ -115,10 +115,10 @@ export type Drovr = {
    *
    * `opts.concurrency` must be a positive integer; Drovr validates immediately.
    * Validates every Name from `opts.name`, rejects duplicates, and skips Names
-   * already recorded as Completions before invoking callbacks. A callback return
-   * records a Completion for that Name; a throw leaves it incomplete and the
-   * callback is replayed on resume. One failed item does not cancel other active
-   * or pending items.
+   * already recorded as Completions before scheduling or consuming concurrency.
+   * A callback return records a Completion for that Name; a throw leaves it incomplete
+   * and the callback is replayed on resume from its beginning under documented
+   * at-least-once semantics. One failed item does not cancel other active or pending items.
    */
   map<T>(
     items: readonly T[],

@@ -43,7 +43,7 @@ export async function runStart(cwd: string, options: StartOptions = {}): Promise
         )
       }
 
-      const db = openProjectDatabase(dbPath)
+      const db = openProjectDatabase(dbPath, { mode })
       try {
         const workflowPath = join(root, WORKFLOW_RELATIVE_PATH)
         if (!(await fileExists(workflowPath))) {

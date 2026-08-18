@@ -45,8 +45,9 @@ describe('published declarations', () => {
 
     expect(source).toContain('`opts.concurrency` must be a positive integer')
     expect(source).toContain('records a Completion for that Name')
-    expect(source).toContain('a throw leaves it incomplete and the')
+    expect(source).toContain('a throw leaves it incomplete')
     expect(source).toContain('callback is replayed on resume')
+    expect(source).toContain('at-least-once')
   })
 
   it('publishes only the root and package metadata subpaths', () => {
