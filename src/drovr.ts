@@ -621,10 +621,12 @@ function isEnoent(error: unknown): boolean {
   return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT'
 }
 
+type WorktreeSetupStatus = 'pending' | 'complete'
+
 function recordWorktreeSetupStatus(
   db: DatabaseSync | undefined,
   name: Name,
-  status: 'pending' | 'complete',
+  status: WorktreeSetupStatus,
 ): void {
   if (!db) {
     return
@@ -634,12 +636,15 @@ function recordWorktreeSetupStatus(
   ).run(name, status)
 }
 
-function getWorktreeSetupStatus(db: DatabaseSync | undefined, name: Name): string | undefined {
+function getWorktreeSetupStatus(
+  db: DatabaseSync | undefined,
+  name: Name,
+): WorktreeSetupStatus | undefined {
   if (!db) {
     return undefined
   }
   const row = db.prepare('SELECT status FROM worktree_setups WHERE name = ?').get(name) as
-    | { status: string }
+    | { status: WorktreeSetupStatus }
     | undefined
   return row?.status
 }
