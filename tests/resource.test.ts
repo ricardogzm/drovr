@@ -109,23 +109,67 @@ export default async function workflow(drovr: Drovr) {
     }
   })
 
-  it('rejects ports-only spec before capacity is implemented', async () => {
+  it('accepts a single declared port with implicit capacity one', async () => {
     const repo = await initRepo()
     try {
       await mkdir(join(repo, '.drovr'), { recursive: true })
       await writeFile(
         join(repo, '.drovr/main.ts'),
         `import type { Drovr } from 'drovr'
+import { writeFile } from 'node:fs/promises'
 export default async function workflow(drovr: Drovr) {
-  // @ts-expect-error test ports-only spec
-  await drovr.resource('res', { ports: 3000 })
+  const res = await drovr.resource('res', { ports: 3000 })
+  const value = await res.lease({ name: 'item' }, async () => 'port-lease-ok')
+  await writeFile('result.txt', value, 'utf8')
 }
 `,
         'utf8',
       )
 
-      expect(() => execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })).toThrow(
-        /positive integer/,
+      execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })
+      expect(await readFile(join(repo, 'result.txt'), 'utf8')).toBe('port-lease-ok')
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects malformed port declarations without repairing them', async () => {
+    const repo = await initRepo()
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from 'drovr'
+import { writeFile } from 'node:fs/promises'
+export default async function workflow(drovr: Drovr) {
+  const cases: readonly [string, unknown][] = [
+    ['duplicate', { ports: [4300, 4300] }],
+    ['noninteger', { ports: 4300.5 }],
+    ['too-low', { ports: 0 }],
+    ['too-high', { ports: 65536 }],
+    ['empty', { ports: [] }],
+    ['reversed', { ports: { from: 4301, to: 4300 } }],
+    ['mixed', { capacity: 1, ports: 4300 }],
+  ]
+  const errors: string[] = []
+  for (const [name, spec] of cases) {
+    try {
+      await drovr.resource(name, spec as never)
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error))
+    }
+  }
+  await writeFile('errors.json', JSON.stringify(errors), 'utf8')
+}
+`,
+        'utf8',
+      )
+
+      execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })
+      const errors = JSON.parse(await readFile(join(repo, 'errors.json'), 'utf8')) as string[]
+      expect(errors).toHaveLength(7)
+      expect(errors.join('\n')).toMatch(
+        /duplicates|integers|nonempty|reversed|both capacity and ports/,
       )
     } finally {
       await rm(repo, { recursive: true, force: true })
@@ -322,6 +366,101 @@ export default async function workflow(drovr: Drovr) {
       expect(firstExit).toBe(`exit:${firstId}`)
       expect(secondExit).toBe(`exit:${secondId}`)
       expect(firstId).not.toBe(secondId)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('Drovr.resource port declarations', () => {
+  it('blocks overlapping declarations atomically while allowing disjoint declarations', async () => {
+    const repo = await initRepo()
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from 'drovr'
+import { appendFile } from 'node:fs/promises'
+
+export default async function workflow(drovr: Drovr) {
+  const overlapA = await drovr.resource('overlap-a', { ports: { from: 4100, to: 4101 } })
+  const overlapB = await drovr.resource('overlap-b', { ports: [4101, 4102] })
+  const disjoint = await drovr.resource('disjoint', { ports: 4103 })
+  const resources = { a: overlapA, b: overlapB, c: disjoint }
+  const items = [
+    { id: 'port-a', resource: 'a' },
+    { id: 'port-b', resource: 'b' },
+    { id: 'port-c', resource: 'c' },
+  ]
+
+  await drovr.map(items, { concurrency: 3, name: (item) => item.id }, async (item) => {
+    await resources[item.resource].lease({ name: item.id }, async () => {
+      await appendFile('timeline.txt', \`enter:\${item.id}\\n\`, 'utf8')
+      await new Promise((resolve) => setTimeout(resolve, 80))
+      await appendFile('timeline.txt', \`exit:\${item.id}\\n\`, 'utf8')
+    })
+  })
+}
+`,
+        'utf8',
+      )
+
+      execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })
+      const timeline = (await readFile(join(repo, 'timeline.txt'), 'utf8')).trim().split('\n')
+      const enterA = timeline.indexOf('enter:port-a')
+      const enterB = timeline.indexOf('enter:port-b')
+      const enterC = timeline.indexOf('enter:port-c')
+      const firstEnter = Math.min(enterA, enterB)
+      const firstExit = timeline.indexOf(firstEnter === enterA ? 'exit:port-a' : 'exit:port-b')
+      const secondEnter = Math.max(enterA, enterB)
+
+      expect(enterA).toBeGreaterThanOrEqual(0)
+      expect(enterB).toBeGreaterThanOrEqual(0)
+      expect(firstExit).toBeGreaterThan(firstEnter)
+      expect(secondEnter).toBeGreaterThan(firstExit)
+      expect(enterC).toBeLessThan(firstExit)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects changing a live declaration and reports loopback probe results', async () => {
+    const repo = await initRepo()
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from 'drovr'
+import { createServer } from 'node:net'
+import { writeFile } from 'node:fs/promises'
+
+export default async function workflow(drovr: Drovr) {
+  const res = await drovr.resource('live-port', { ports: 4200 })
+  const server = createServer()
+  await new Promise<void>((resolve) => server.listen(4200, '127.0.0.1', resolve))
+  await res.lease({ name: 'item' }, async () => {
+    try {
+      await drovr.resource('live-port', { ports: 4201 })
+      await writeFile('changed.txt', 'unexpected-success', 'utf8')
+    } catch (error) {
+      await writeFile('changed.txt', error instanceof Error ? error.message : String(error), 'utf8')
+    }
+  })
+  server.close()
+}
+`,
+        'utf8',
+      )
+
+      execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })
+      expect(await readFile(join(repo, 'changed.txt'), 'utf8')).toMatch(/cannot change ports/)
+      const log = await readFile(join(repo, '.drovr/drovr.log'), 'utf8')
+      expect(log).toMatch(
+        /resource\.port\.probe resource=live-port name=item port=4200 address=127\.0\.0\.1 status=in-use/,
+      )
+      expect(log).toMatch(
+        /resource\.port\.probe resource=live-port name=item port=4200 address=::1 status=(available|in-use|unavailable)/,
+      )
     } finally {
       await rm(repo, { recursive: true, force: true })
     }

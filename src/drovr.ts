@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { lstat, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { createServer } from 'node:net'
 import { join } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
 import {
@@ -50,6 +51,84 @@ export function isValidName(name: unknown): name is Name {
   return typeof name === 'string' && NAME_REGEX.test(name)
 }
 
+function normalizePortSpec(spec: unknown): number[] {
+  if (typeof spec === 'number') {
+    if (!Number.isInteger(spec) || spec < 1 || spec > 65535) {
+      throw new TypeError('resource ports must be integers from 1 through 65535')
+    }
+    return [spec]
+  }
+
+  if (Array.isArray(spec)) {
+    if (spec.length === 0) {
+      throw new TypeError('resource ports list must be nonempty')
+    }
+    const ports = spec.map((port) => {
+      if (typeof port !== 'number' || !Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new TypeError('resource ports must be integers from 1 through 65535')
+      }
+      return port
+    })
+    if (new Set(ports).size !== ports.length) {
+      throw new TypeError('resource ports list must not contain duplicates')
+    }
+    return ports.sort((a, b) => a - b)
+  }
+
+  if (typeof spec === 'object' && spec !== null && 'from' in spec && 'to' in spec) {
+    const range = spec as { from?: unknown; to?: unknown }
+    const from = range.from
+    const to = range.to
+    if (
+      typeof from !== 'number' ||
+      !Number.isInteger(from) ||
+      from < 1 ||
+      from > 65535 ||
+      typeof to !== 'number' ||
+      !Number.isInteger(to) ||
+      to < 1 ||
+      to > 65535
+    ) {
+      throw new TypeError('resource port range endpoints must be integers from 1 through 65535')
+    }
+    if (from > to) {
+      throw new TypeError('resource port range must not be reversed')
+    }
+    return Array.from({ length: to - from + 1 }, (_, index) => from + index)
+  }
+
+  throw new TypeError('resource ports must be a port, nonempty list, or range')
+}
+
+function samePorts(left: readonly number[], right: readonly number[]): boolean {
+  return left.length === right.length && left.every((port, index) => port === right[index])
+}
+
+type PortProbeStatus = 'available' | 'in-use' | 'unavailable'
+function probeLoopbackPort(port: number, host: '127.0.0.1' | '::1'): Promise<PortProbeStatus> {
+  return new Promise((resolve) => {
+    const server = createServer()
+    let settled = false
+    const finish = (status: PortProbeStatus) => {
+      if (settled) return
+      settled = true
+      try {
+        server.close(() => resolve(status))
+      } catch {
+        resolve(status)
+      }
+    }
+    server.once('error', (error: NodeJS.ErrnoException) => {
+      finish(error.code === 'EADDRINUSE' ? 'in-use' : 'unavailable')
+    })
+    try {
+      server.listen({ port, host, exclusive: true }, () => finish('available'))
+    } catch {
+      finish('unavailable')
+    }
+  })
+}
+
 export function createDrovr(context: DrovrContext = {}): Drovr {
   const { db, logger, counts, root, cwd, mode = 'fresh' } = context
   const workingDir = root ?? cwd ?? process.cwd()
@@ -57,19 +136,22 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
   const activeLeaseCounts = new Map<string, number>()
   const resourceReleaseNotifier = new EventEmitter()
   resourceReleaseNotifier.setMaxListeners(0)
-
-  async function waitForResourceRelease(resourceName: string): Promise<void> {
+  async function waitForResourceRelease(
+    resourceName: string,
+    portResource: boolean,
+  ): Promise<void> {
     await new Promise<void>((resolve) => {
       let timer: NodeJS.Timeout | undefined
+      const eventName = portResource ? 'release:port' : `release:${resourceName}`
       const onRelease = () => {
         cleanup()
         resolve()
       }
       const cleanup = () => {
         clearTimeout(timer)
-        resourceReleaseNotifier.removeListener(`release:${resourceName}`, onRelease)
+        resourceReleaseNotifier.removeListener(eventName, onRelease)
       }
-      resourceReleaseNotifier.once(`release:${resourceName}`, onRelease)
+      resourceReleaseNotifier.once(eventName, onRelease)
       timer = setTimeout(() => {
         cleanup()
         resolve()
@@ -95,41 +177,103 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
       if ('capacity' in spec && 'ports' in spec) {
         throw new TypeError('resource spec cannot contain both capacity and ports')
       }
-      if (!('capacity' in spec)) {
-        throw new TypeError('resource capacity must be a positive integer')
+      if (!('capacity' in spec) && !('ports' in spec)) {
+        throw new TypeError('resource spec must contain capacity or ports')
       }
 
-      const capacity = spec.capacity
-      if (typeof capacity !== 'number' || !Number.isInteger(capacity) || capacity < 1) {
+      const isPortResource = 'ports' in spec
+      const normalizedPorts: number[] | undefined = isPortResource
+        ? normalizePortSpec(spec.ports)
+        : undefined
+      const capacity = 'capacity' in spec ? spec.capacity : 1
+      if (
+        !isPortResource &&
+        (typeof capacity !== 'number' || !Number.isInteger(capacity) || capacity < 1)
+      ) {
         throw new TypeError('resource capacity must be a positive integer')
       }
 
       if (db) {
-        const existing = db
-          .prepare('SELECT type, capacity FROM resources WHERE name = ?')
-          .get(name) as { type: string; capacity: number } | undefined
+        db.exec('BEGIN IMMEDIATE;')
+        try {
+          const existing = db
+            .prepare('SELECT type, capacity FROM resources WHERE name = ?')
+            .get(name) as { type: string; capacity: number } | undefined
+          const occupancy = existing
+            ? ((
+                db
+                  .prepare('SELECT COUNT(*) as count FROM leases WHERE resource_name = ?')
+                  .get(name) as {
+                  count: number
+                }
+              ).count as number)
+            : 0
 
-        if (existing !== undefined) {
-          const occupancyRow = db
-            .prepare('SELECT COUNT(*) as count FROM leases WHERE resource_name = ?')
-            .get(name) as { count: number }
-          const occupancy = occupancyRow.count
-          if (capacity < occupancy) {
-            throw new Error(
-              `cannot reduce capacity of resource "${name}" from ${existing.capacity} to ${capacity} below live occupancy of ${occupancy}`,
+          if (existing === undefined) {
+            db.prepare('INSERT INTO resources (name, type, capacity) VALUES (?, ?, ?)').run(
+              name,
+              isPortResource ? 'port' : 'capacity',
+              capacity,
+            )
+            if (isPortResource) {
+              for (const port of normalizedPorts ?? []) {
+                db.prepare('INSERT INTO resource_ports (resource_name, port) VALUES (?, ?)').run(
+                  name,
+                  port,
+                )
+              }
+            }
+          } else if (isPortResource) {
+            const currentPorts =
+              existing.type === 'port'
+                ? (
+                    db
+                      .prepare(
+                        'SELECT port FROM resource_ports WHERE resource_name = ? ORDER BY port',
+                      )
+                      .all(name) as Array<{ port: number }>
+                  ).map((row) => row.port)
+                : []
+            const changed = !samePorts(currentPorts, normalizedPorts ?? [])
+            if (changed && occupancy > 0) {
+              throw new Error(`cannot change ports of resource "${name}" while it has live leases`)
+            }
+            if (changed || existing.type !== 'port') {
+              db.prepare('DELETE FROM resource_ports WHERE resource_name = ?').run(name)
+              for (const port of normalizedPorts ?? []) {
+                db.prepare('INSERT INTO resource_ports (resource_name, port) VALUES (?, ?)').run(
+                  name,
+                  port,
+                )
+              }
+            }
+            db.prepare('UPDATE resources SET type = ?, capacity = ? WHERE name = ?').run(
+              'port',
+              1,
+              name,
+            )
+          } else {
+            if (existing.type === 'port' && occupancy > 0) {
+              throw new Error(`cannot change resource "${name}" while it has live leases`)
+            }
+            if ((capacity as number) < occupancy) {
+              throw new Error(
+                `cannot reduce capacity of resource "${name}" from ${existing.capacity} to ${capacity} below live occupancy of ${occupancy}`,
+              )
+            }
+            db.prepare('DELETE FROM resource_ports WHERE resource_name = ?').run(name)
+            db.prepare('UPDATE resources SET type = ?, capacity = ? WHERE name = ?').run(
+              'capacity',
+              capacity,
+              name,
             )
           }
-          db.prepare('UPDATE resources SET type = ?, capacity = ? WHERE name = ?').run(
-            'capacity',
-            capacity,
-            name,
-          )
-        } else {
-          db.prepare('INSERT INTO resources (name, type, capacity) VALUES (?, ?, ?)').run(
-            name,
-            'capacity',
-            capacity,
-          )
+          db.exec('COMMIT;')
+        } catch (error) {
+          try {
+            db.exec('ROLLBACK;')
+          } catch {}
+          throw error
         }
       }
 
@@ -164,32 +308,47 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
 
                 if (existingLease !== undefined) {
                   acquired = true
-                  db.exec('COMMIT;')
                 } else {
                   const resRow = db
-                    .prepare('SELECT capacity FROM resources WHERE name = ?')
-                    .get(name) as { capacity: number } | undefined
+                    .prepare('SELECT type, capacity FROM resources WHERE name = ?')
+                    .get(name) as { type: string; capacity: number } | undefined
 
                   if (!resRow) {
-                    db.exec('ROLLBACK;')
                     throw new Error(`resource "${name}" not found in database`)
                   }
 
-                  const occupancyRow = db
-                    .prepare('SELECT COUNT(*) as count FROM leases WHERE resource_name = ?')
-                    .get(name) as { count: number }
+                  let canAcquire = false
+                  if (resRow.type === 'port') {
+                    const conflict = db
+                      .prepare(
+                        `SELECT 1
+                           FROM leases AS held
+                           JOIN resource_ports AS held_port
+                             ON held_port.resource_name = held.resource_name
+                          WHERE held.resource_name <> ?
+                            AND held_port.port IN (
+                              SELECT port FROM resource_ports WHERE resource_name = ?
+                            )
+                          LIMIT 1`,
+                      )
+                      .get(name, name)
+                    canAcquire = conflict === undefined
+                  } else {
+                    const occupancyRow = db
+                      .prepare('SELECT COUNT(*) as count FROM leases WHERE resource_name = ?')
+                      .get(name) as { count: number }
+                    canAcquire = occupancyRow.count < resRow.capacity
+                  }
 
-                  if (occupancyRow.count < resRow.capacity) {
+                  if (canAcquire) {
                     db.prepare('INSERT INTO leases (resource_name, name) VALUES (?, ?)').run(
                       name,
                       opts.name,
                     )
                     acquired = true
-                    db.exec('COMMIT;')
-                  } else {
-                    db.exec('COMMIT;')
                   }
                 }
+                db.exec('COMMIT;')
               } catch (err) {
                 try {
                   db.exec('ROLLBACK;')
@@ -210,10 +369,23 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
               logger?.resourceLeaseWait(name, opts.name)
             }
 
-            await waitForResourceRelease(name)
+            await waitForResourceRelease(name, isPortResource)
           }
 
           logger?.resourceLeaseAcquire(name, opts.name)
+          if (normalizedPorts !== undefined) {
+            for (const port of normalizedPorts) {
+              for (const host of ['127.0.0.1', '::1'] as const) {
+                void probeLoopbackPort(port, host)
+                  .then((status) => {
+                    try {
+                      logger?.resourcePortProbe?.(name, opts.name, port, host, status)
+                    } catch {}
+                  })
+                  .catch(() => {})
+              }
+            }
+          }
 
           try {
             return await fn()
@@ -227,7 +399,7 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
                 )
               }
               activeLeaseCounts.delete(leaseKey)
-              resourceReleaseNotifier.emit(`release:${name}`)
+              resourceReleaseNotifier.emit(isPortResource ? 'release:port' : `release:${name}`)
             } else {
               activeLeaseCounts.set(leaseKey, remaining)
             }
