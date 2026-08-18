@@ -13,8 +13,20 @@ export interface RunWorktreeSetupOptions {
   stderrStream?: NodeJS.WritableStream
 }
 
-interface StreamState {
+interface DestinationState {
   isAtLineStart: boolean
+  lastWriterPrefix: string | null
+}
+
+const destinationStates = new WeakMap<NodeJS.WritableStream, DestinationState>()
+
+function getDestinationState(stream: NodeJS.WritableStream): DestinationState {
+  let state = destinationStates.get(stream)
+  if (!state) {
+    state = { isAtLineStart: true, lastWriterPrefix: null }
+    destinationStates.set(stream, state)
+  }
+  return state
 }
 
 function isEnoent(error: unknown): boolean {
@@ -64,32 +76,46 @@ export async function readWorktreeSetupConfig(worktreePath: string, name: Name):
   return parsed
 }
 
-function formatChunkWithPrefix(text: string, prefix: string, state: StreamState): string {
+function formatAndWriteChunk(
+  text: string,
+  prefix: string,
+  destState: DestinationState,
+  writable: NodeJS.WritableStream,
+): void {
   if (text.length === 0) {
-    return ''
+    return
   }
 
-  let result = ''
   let startIdx = 0
 
   while (startIdx < text.length) {
-    if (state.isAtLineStart) {
-      result += prefix
-      state.isAtLineStart = false
+    if (!destState.isAtLineStart && destState.lastWriterPrefix !== prefix) {
+      writable.write('\n')
+      destState.isAtLineStart = true
+      destState.lastWriterPrefix = null
+    }
+
+    if (destState.isAtLineStart) {
+      writable.write(prefix)
+      destState.isAtLineStart = false
+      destState.lastWriterPrefix = prefix
     }
 
     const newlineIdx = text.indexOf('\n', startIdx)
     if (newlineIdx === -1) {
-      result += text.slice(startIdx)
+      const slice = text.slice(startIdx)
+      writable.write(slice)
+      destState.isAtLineStart = false
+      destState.lastWriterPrefix = prefix
       break
     }
 
-    result += text.slice(startIdx, newlineIdx + 1)
-    state.isAtLineStart = true
+    const slice = text.slice(startIdx, newlineIdx + 1)
+    writable.write(slice)
+    destState.isAtLineStart = true
+    destState.lastWriterPrefix = prefix
     startIdx = newlineIdx + 1
   }
-
-  return result
 }
 
 function pipeWithPrefix(
@@ -99,21 +125,17 @@ function pipeWithPrefix(
 ): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const decoder = new StringDecoder('utf8')
-    const state: StreamState = { isAtLineStart: true }
+    const destState = getDestinationState(writable)
 
     readable.on('data', (chunk: Buffer | string) => {
       const text = typeof chunk === 'string' ? chunk : decoder.write(chunk)
-      const formatted = formatChunkWithPrefix(text, prefix, state)
-      if (formatted.length > 0) {
-        writable.write(formatted)
-      }
+      formatAndWriteChunk(text, prefix, destState, writable)
     })
 
     readable.on('end', () => {
       const rest = decoder.end()
-      const formatted = formatChunkWithPrefix(rest, prefix, state)
-      if (formatted.length > 0) {
-        writable.write(formatted)
+      if (rest.length > 0) {
+        formatAndWriteChunk(rest, prefix, destState, writable)
       }
       resolve()
     })

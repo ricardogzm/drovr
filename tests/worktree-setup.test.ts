@@ -653,4 +653,112 @@ export default async function workflow(drovr: Drovr): Promise<void> {
       await rm(repo, { recursive: true, force: true })
     }
   })
+  it('coordinates concurrent stdout streaming so partial A, full B, and continuation A lines are each fully attributed', async () => {
+    const repo = await initRepo()
+    const syncDir = await mkdtemp(join(tmpdir(), 'drovr-sync-stdout-'))
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr', 'worktrees.json'),
+        JSON.stringify([
+          `name="$(basename "$PWD")"; if [ "$name" = "item-a" ]; then printf "a-partial" && touch "${syncDir}/a_started" && while [ ! -f "${syncDir}/b_done" ]; do sleep 0.05; done && echo "-continuation"; else while [ ! -f "${syncDir}/a_started" ]; do sleep 0.05; done && echo "b-full-line" && touch "${syncDir}/b_done"; fi`,
+        ]),
+        'utf8',
+      )
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+
+export default async function workflow(drovr: Drovr): Promise<void> {
+  await drovr.map(
+    ['item-a', 'item-b'],
+    { concurrency: 2, name: (x) => x },
+    async (name) => {
+      await drovr.worktree({ name })
+    }
+  )
+}
+`,
+        'utf8',
+      )
+      runGit(repo, ['add', '.drovr'])
+      runGit(repo, ['commit', '-m', 'add concurrent interleaved stdout test'])
+
+      const proc = spawnSync('node', [drovr, 'start'], {
+        cwd: repo,
+        encoding: 'utf8',
+      })
+
+      expect(proc.status).toBe(0)
+      const lines = proc.stdout.trim().split('\n')
+      expect(lines).toContain('[item-a setup 1/1] a-partial')
+      expect(lines).toContain('[item-b setup 1/1] b-full-line')
+      expect(lines).toContain('[item-a setup 1/1] -continuation')
+
+      // Every line in stdout must start with a recognized prefix
+      for (const line of lines) {
+        expect(line).toMatch(/^\[(?:item-a|item-b) setup 1\/1\] /)
+      }
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+      await rm(syncDir, { recursive: true, force: true })
+    }
+  })
+
+  it('coordinates concurrent stderr streaming so partial A, full B, and continuation A lines are each fully attributed', async () => {
+    const repo = await initRepo()
+    const syncDir = await mkdtemp(join(tmpdir(), 'drovr-sync-stderr-'))
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr', 'worktrees.json'),
+        JSON.stringify([
+          `name="$(basename "$PWD")"; if [ "$name" = "item-a" ]; then printf "a-err-partial" >&2 && touch "${syncDir}/a_err_started" && while [ ! -f "${syncDir}/b_err_done" ]; do sleep 0.05; done && echo "-err-continuation" >&2; else while [ ! -f "${syncDir}/a_err_started" ]; do sleep 0.05; done && echo "b-err-full-line" >&2 && touch "${syncDir}/b_err_done"; fi`,
+        ]),
+        'utf8',
+      )
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+
+export default async function workflow(drovr: Drovr): Promise<void> {
+  await drovr.map(
+    ['item-a', 'item-b'],
+    { concurrency: 2, name: (x) => x },
+    async (name) => {
+      await drovr.worktree({ name })
+    }
+  )
+}
+`,
+        'utf8',
+      )
+      runGit(repo, ['add', '.drovr'])
+      runGit(repo, ['commit', '-m', 'add concurrent interleaved stderr test'])
+
+      const proc = spawnSync('node', [drovr, 'start'], {
+        cwd: repo,
+        encoding: 'utf8',
+      })
+
+      expect(proc.status).toBe(0)
+      const lines = proc.stderr
+        .trim()
+        .split('\n')
+        .filter((l) => !l.startsWith('Warning:'))
+      expect(lines).toContain('[item-a setup 1/1] a-err-partial')
+      expect(lines).toContain('[item-b setup 1/1] b-err-full-line')
+      expect(lines).toContain('[item-a setup 1/1] -err-continuation')
+
+      // Every line in setup stderr must start with a recognized prefix
+      for (const line of lines) {
+        expect(line).toMatch(/^\[(?:item-a|item-b) setup 1\/1\] /)
+      }
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+      await rm(syncDir, { recursive: true, force: true })
+    }
+  })
 })
