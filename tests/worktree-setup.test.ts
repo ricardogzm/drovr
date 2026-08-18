@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from 'node:child_process'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -244,6 +244,113 @@ export default async function workflow(drovr: Drovr): Promise<void> {
       expect(proc.stdout).toContain('[stream-item setup 2/2] running pre-flight')
       expect(proc.stderr).toContain('[stream-item setup 1/2] asset warning')
       expect(proc.stderr).toContain('[stream-item setup 2/2] pre-flight note')
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+  it('streams identified live stdout immediately without waiting for newline or command exit/delay', async () => {
+    const repo = await initRepo()
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr', 'worktrees.json'),
+        JSON.stringify(['printf "live-token" && sleep 1 && echo " completed"']),
+        'utf8',
+      )
+      runGit(repo, ['add', '.drovr/worktrees.json'])
+      runGit(repo, ['commit', '-m', 'add live unbuffered stdout setup test'])
+
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+
+export default async function workflow(drovr: Drovr): Promise<void> {
+  await drovr.worktree({ name: 'live-stdout-item' })
+}
+`,
+        'utf8',
+      )
+
+      const proc = spawn('node', [drovr, 'start'], {
+        cwd: repo,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+
+      let liveTokenSeenBeforeExit = false
+      let fullStdout = ''
+
+      proc.stdout.on('data', (chunk: Buffer | string) => {
+        fullStdout += chunk.toString()
+        if (fullStdout.includes('[live-stdout-item setup 1/1] live-token')) {
+          // At the moment live-token is seen, command has not finished and 'completed' is not yet emitted
+          if (!fullStdout.includes('completed') && proc.exitCode === null) {
+            liveTokenSeenBeforeExit = true
+          }
+        }
+      })
+
+      const exitCode = await new Promise<number | null>((resolve) => {
+        proc.on('close', (code) => resolve(code))
+      })
+
+      expect(exitCode).toBe(0)
+      expect(liveTokenSeenBeforeExit).toBe(true)
+      expect(fullStdout).toContain('[live-stdout-item setup 1/1] live-token completed\n')
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('streams identified live stderr immediately without waiting for newline or command exit/delay', async () => {
+    const repo = await initRepo()
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr', 'worktrees.json'),
+        JSON.stringify(['printf "live-err-token" >&2 && sleep 1 && echo " err-completed" >&2']),
+        'utf8',
+      )
+      runGit(repo, ['add', '.drovr/worktrees.json'])
+      runGit(repo, ['commit', '-m', 'add live unbuffered stderr setup test'])
+
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+
+export default async function workflow(drovr: Drovr): Promise<void> {
+  await drovr.worktree({ name: 'live-stderr-item' })
+}
+`,
+        'utf8',
+      )
+
+      const proc = spawn('node', [drovr, 'start'], {
+        cwd: repo,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+
+      let liveErrTokenSeenBeforeExit = false
+      let fullStderr = ''
+
+      proc.stderr.on('data', (chunk: Buffer | string) => {
+        fullStderr += chunk.toString()
+        if (fullStderr.includes('[live-stderr-item setup 1/1] live-err-token')) {
+          // At the moment live-err-token is seen, command has not finished and 'err-completed' is not yet emitted
+          if (!fullStderr.includes('err-completed') && proc.exitCode === null) {
+            liveErrTokenSeenBeforeExit = true
+          }
+        }
+      })
+
+      const exitCode = await new Promise<number | null>((resolve) => {
+        proc.on('close', (code) => resolve(code))
+      })
+
+      expect(exitCode).toBe(0)
+      expect(liveErrTokenSeenBeforeExit).toBe(true)
+      expect(fullStderr).toContain('[live-stderr-item setup 1/1] live-err-token err-completed\n')
     } finally {
       await rm(repo, { recursive: true, force: true })
     }

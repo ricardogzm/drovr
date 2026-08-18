@@ -2,23 +2,26 @@ import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
+import type { Name } from './index'
 
 export interface RunWorktreeSetupOptions {
   worktreePath: string
-  name: string
+  name: Name
   startCheckout: string
   stdoutStream?: NodeJS.WritableStream
   stderrStream?: NodeJS.WritableStream
+}
+
+interface StreamState {
+  isAtLineStart: boolean
 }
 
 function isEnoent(error: unknown): boolean {
   return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT'
 }
 
-export async function readWorktreeSetupConfig(
-  worktreePath: string,
-  name: string,
-): Promise<string[]> {
+export async function readWorktreeSetupConfig(worktreePath: string, name: Name): Promise<string[]> {
   const configPath = join(worktreePath, '.drovr', 'worktrees.json')
   let content: string
   try {
@@ -61,27 +64,60 @@ export async function readWorktreeSetupConfig(
   return parsed
 }
 
+function formatChunkWithPrefix(text: string, prefix: string, state: StreamState): string {
+  if (text.length === 0) {
+    return ''
+  }
+
+  let result = ''
+  let startIdx = 0
+
+  while (startIdx < text.length) {
+    if (state.isAtLineStart) {
+      result += prefix
+      state.isAtLineStart = false
+    }
+
+    const newlineIdx = text.indexOf('\n', startIdx)
+    if (newlineIdx === -1) {
+      result += text.slice(startIdx)
+      break
+    }
+
+    result += text.slice(startIdx, newlineIdx + 1)
+    state.isAtLineStart = true
+    startIdx = newlineIdx + 1
+  }
+
+  return result
+}
+
 function pipeWithPrefix(
   readable: NodeJS.ReadableStream,
   writable: NodeJS.WritableStream,
   prefix: string,
 ): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    let buffer = ''
+    const decoder = new StringDecoder('utf8')
+    const state: StreamState = { isAtLineStart: true }
+
     readable.on('data', (chunk: Buffer | string) => {
-      buffer += chunk.toString()
-      const lines = buffer.split('\n')
-      buffer = lines.pop() ?? ''
-      for (const line of lines) {
-        writable.write(`${prefix}${line}\n`)
+      const text = typeof chunk === 'string' ? chunk : decoder.write(chunk)
+      const formatted = formatChunkWithPrefix(text, prefix, state)
+      if (formatted.length > 0) {
+        writable.write(formatted)
       }
     })
+
     readable.on('end', () => {
-      if (buffer.length > 0) {
-        writable.write(`${prefix}${buffer}\n`)
+      const rest = decoder.end()
+      const formatted = formatChunkWithPrefix(rest, prefix, state)
+      if (formatted.length > 0) {
+        writable.write(formatted)
       }
       resolve()
     })
+
     readable.on('error', (err) => {
       reject(err)
     })
@@ -92,7 +128,7 @@ function runSetupCommand(
   cmd: string,
   index: number,
   total: number,
-  name: string,
+  name: Name,
   worktreePath: string,
   startCheckout: string,
   stdoutStream: NodeJS.WritableStream,
