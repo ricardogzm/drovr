@@ -1,0 +1,104 @@
+import { execFileSync } from 'node:child_process'
+
+export interface HerdrWorkspaceResult {
+  workspaceId: string
+  rootPaneId: string
+}
+
+export function runHerdr(cwd: string, args: string[]): string {
+  try {
+    return execFileSync('herdr', args, {
+      cwd,
+      encoding: 'utf8',
+      env: process.env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trimEnd()
+  } catch (error: unknown) {
+    if (typeof error === 'object' && error !== null && 'stderr' in error) {
+      const stderr =
+        typeof error.stderr === 'string'
+          ? error.stderr.trim()
+          : error.stderr instanceof Buffer
+            ? error.stderr.toString('utf8').trim()
+            : ''
+      if (stderr) {
+        throw new Error(`herdr ${args.slice(0, 2).join(' ')} failed: ${stderr}`)
+      }
+    }
+    throw error
+  }
+}
+
+export function createHerdrWorkspace(
+  cwd: string,
+  options: { cwd: string; label?: string; noFocus?: boolean },
+): HerdrWorkspaceResult {
+  const args = ['workspace', 'create', '--cwd', options.cwd]
+  if (options.label) {
+    args.push('--label', options.label)
+  }
+  if (options.noFocus) {
+    args.push('--no-focus')
+  }
+  const output = runHerdr(cwd, args)
+  try {
+    const data: unknown = JSON.parse(output)
+    if (typeof data === 'object' && data !== null) {
+      const res: unknown =
+        'result' in data && typeof data.result === 'object' && data.result !== null
+          ? data.result
+          : data
+      if (typeof res === 'object' && res !== null) {
+        let workspaceId: string | undefined
+        if (
+          'workspace' in res &&
+          typeof res.workspace === 'object' &&
+          res.workspace !== null &&
+          'workspace_id' in res.workspace &&
+          typeof res.workspace.workspace_id === 'string'
+        ) {
+          workspaceId = res.workspace.workspace_id
+        } else if ('workspace_id' in res && typeof res.workspace_id === 'string') {
+          workspaceId = res.workspace_id
+        }
+
+        let rootPaneId: string | undefined
+        if (
+          'root_pane' in res &&
+          typeof res.root_pane === 'object' &&
+          res.root_pane !== null &&
+          'pane_id' in res.root_pane &&
+          typeof res.root_pane.pane_id === 'string'
+        ) {
+          rootPaneId = res.root_pane.pane_id
+        } else if ('pane_id' in res && typeof res.pane_id === 'string') {
+          rootPaneId = res.pane_id
+        }
+
+        if (workspaceId && rootPaneId) {
+          return { workspaceId, rootPaneId }
+        }
+      }
+    }
+  } catch (err: unknown) {
+    if (err instanceof Error && err.message.startsWith('herdr')) {
+      throw err
+    }
+  }
+  throw new Error(`failed to parse workspace create output: ${output}`)
+}
+
+export function closeHerdrWorkspace(cwd: string, workspaceId: string): void {
+  runHerdr(cwd, ['workspace', 'close', workspaceId])
+}
+
+export function startHerdrAgent(
+  cwd: string,
+  options: { name: string; kind: string; paneId: string; ompArgs?: string[] },
+): void {
+  const args = ['agent', 'start', options.name, '--kind', options.kind, '--pane', options.paneId]
+  if (options.ompArgs && options.ompArgs.length > 0) {
+    args.push('--', ...options.ompArgs)
+  }
+  runHerdr(cwd, args)
+}

@@ -22,7 +22,8 @@ import {
   safeRealpath,
 } from './git'
 import { runWorktreeSetup } from './worktree-setup'
-import type { Drovr, Issue, Name, Worktree } from './index'
+import { closeHerdrWorkspace, createHerdrWorkspace, startHerdrAgent } from './herdr'
+import type { Drovr, Issue, Name, Worker, Worktree } from './index'
 import type { DrovrLogger, DrovrLoggerCounts } from './log'
 import { mergeExactLine } from './merge-line'
 
@@ -383,8 +384,46 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
         path: worktreePath,
       })
     },
-    async start() {
-      throw new Error('start is not implemented yet')
+    async start(opts: { name: Name; cwd: string }): Promise<Worker> {
+      if (typeof opts !== 'object' || opts === null) {
+        throw new TypeError('start options must be an object')
+      }
+      if (!isValidName(opts.name)) {
+        throw new TypeError(
+          `Invalid name: "${String(opts.name)}". Names must match [a-z][a-z0-9_-]{0,31}`,
+        )
+      }
+      if (typeof opts.cwd !== 'string' || opts.cwd.trim() === '') {
+        throw new TypeError('start opts.cwd must be a non-empty string')
+      }
+
+      const name = opts.name
+      const targetCwd = opts.cwd
+
+      const { workspaceId, rootPaneId } = createHerdrWorkspace(workingDir, {
+        cwd: targetCwd,
+        label: name,
+        noFocus: true,
+      })
+
+      try {
+        startHerdrAgent(workingDir, {
+          name,
+          kind: 'omp',
+          paneId: rootPaneId,
+        })
+      } catch (err) {
+        try {
+          closeHerdrWorkspace(workingDir, workspaceId)
+        } catch {}
+        throw err
+      }
+
+      return Object.freeze({
+        async prompt(): Promise<void> {
+          throw new Error('prompt is not implemented yet')
+        },
+      })
     },
     issues: {
       async list(opts?: { repo?: string }): Promise<readonly Issue[]> {
