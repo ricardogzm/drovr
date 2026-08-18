@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -22,6 +22,7 @@ async function initRepo(): Promise<string> {
   runGit(dir, ['commit', '-m', 'init'])
   return dir
 }
+
 function extractExecError(err: unknown): { status?: number; stderr: string } {
   if (typeof err === 'object' && err !== null) {
     const status = 'status' in err && typeof err.status === 'number' ? err.status : undefined
@@ -60,16 +61,9 @@ interface MockHerdrAgent {
   argv: string[]
 }
 
-interface MockHerdrInvocation {
-  command: string
-  args: string[]
-  timestamp: number
-}
-
 interface MockHerdrState {
   workspaces?: MockHerdrWorkspace[]
   agents?: MockHerdrAgent[]
-  invocations?: MockHerdrInvocation[]
   failNextWorkspaceCreate?: boolean | string
   failNextAgentStart?: boolean | string
   failAgentStartForName?: Record<string, string>
@@ -86,7 +80,6 @@ async function setupMockHerdr(
   const defaultState: MockHerdrState = {
     workspaces: [],
     agents: [],
-    invocations: [],
     nextWorkspaceNum: 1,
     ...initialState,
   }
@@ -104,18 +97,24 @@ if (!statePath || !fs.existsSync(statePath)) {
 const state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
 if (!state.workspaces) state.workspaces = []
 if (!state.agents) state.agents = []
-if (!state.invocations) state.invocations = []
 if (!state.nextWorkspaceNum) state.nextWorkspaceNum = 1
 
 const args = process.argv.slice(2)
-state.invocations.push({
-  command: args[0] || '',
-  args: args.slice(1),
-  timestamp: Date.now(),
-})
 
 function saveState() {
   fs.writeFileSync(statePath, JSON.stringify(state, null, 2), 'utf8')
+}
+
+// Reject forbidden Herdr Worktree commands
+if (args[0] === 'worktree') {
+  console.error('error: forbidden Herdr command: worktree')
+  process.exit(1)
+}
+
+// Reject forbidden raw pane commands
+if (args[0] === 'pane') {
+  console.error('error: forbidden Herdr command: pane')
+  process.exit(1)
 }
 
 // Subcommand: herdr workspace create [OPTIONS]
@@ -281,6 +280,14 @@ if (args[0] === 'agent' && args[1] === 'start') {
     process.exit(1)
   }
 
+  // Reject forbidden continue/resume or RPC mode flags
+  for (const arg of ompArgs) {
+    if (['-r', '--resume', '-c', '--continue', '--mode', 'rpc', 'rpc-ui'].includes(arg)) {
+      console.error('error: forbidden agent start argument: ' + arg)
+      process.exit(1)
+    }
+  }
+
   const ws = state.workspaces.find((w) => w.root_pane && w.root_pane.pane_id === paneId)
 
   const agentRecord = {
@@ -349,6 +356,58 @@ process.exit(1)
   return { binDir, statePath }
 }
 
+function listHerdrWorkspaces(binDir: string, statePath: string): MockHerdrWorkspace[] {
+  const output = execFileSync('herdr', ['workspace', 'list'], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      PATH: `${binDir}:${process.env.PATH}`,
+      HERDR_STATE_FILE: statePath,
+    },
+  })
+  const parsed = JSON.parse(output) as {
+    result?: { workspaces?: MockHerdrWorkspace[] }
+    workspaces?: MockHerdrWorkspace[]
+  }
+  return parsed.result?.workspaces ?? parsed.workspaces ?? []
+}
+
+function listHerdrAgents(binDir: string, statePath: string): MockHerdrAgent[] {
+  const output = execFileSync('herdr', ['agent', 'list'], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      PATH: `${binDir}:${process.env.PATH}`,
+      HERDR_STATE_FILE: statePath,
+    },
+  })
+  const parsed = JSON.parse(output) as {
+    result?: { agents?: MockHerdrAgent[] }
+    agents?: MockHerdrAgent[]
+  }
+  return parsed.result?.agents ?? parsed.agents ?? []
+}
+
+function getHerdrAgent(binDir: string, statePath: string, name: string): MockHerdrAgent | null {
+  try {
+    const output = execFileSync('herdr', ['agent', 'get', name], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH}`,
+        HERDR_STATE_FILE: statePath,
+      },
+    })
+    const parsed = JSON.parse(output) as {
+      result?: { agent?: MockHerdrAgent }
+      agent?: MockHerdrAgent
+    }
+    return parsed.result?.agent ?? parsed.agent ?? null
+  } catch {
+    return null
+  }
+}
+
 beforeAll(() => {
   execFileSync('pnpm', ['run', 'build'], { cwd: root, stdio: 'inherit' })
 })
@@ -384,33 +443,26 @@ export default async function (drovr: Drovr) {
       },
     })
 
-    const finalState: MockHerdrState = JSON.parse(await readFile(statePath, 'utf8'))
-
-    // 1. One workspace was created
-    expect(finalState.workspaces).toHaveLength(1)
-    const ws = finalState.workspaces![0]
+    // Observe external Herdr state through herdr workspace list and herdr agent list
+    const workspaces = listHerdrWorkspaces(binDir, statePath)
+    expect(workspaces).toHaveLength(1)
+    const ws = workspaces[0]
     expect(ws.cwd).toBe(join(dir, '.worktrees/worker-a'))
     expect(ws.label).toBe('worker-a')
     expect(ws.focused).toBe(false)
 
-    // 2. One OMP agent was started in root pane
-    expect(finalState.agents).toHaveLength(1)
-    const agent = finalState.agents![0]
+    const agents = listHerdrAgents(binDir, statePath)
+    expect(agents).toHaveLength(1)
+    const agent = agents[0]
     expect(agent.name).toBe('worker-a')
     expect(agent.kind).toBe('omp')
     expect(agent.pane_id).toBe(ws.root_pane.pane_id)
     expect(agent.workspace_id).toBe(ws.workspace_id)
-    expect(agent.argv).toEqual([]) // No continue or resume flags
+    expect(agent.argv).toEqual([])
 
-    // 3. Drovr controlled Worker creation only through Herdr workspace and agent commands
-    // No OMP RPC, no raw pane input, no Herdr worktree creation
-    const invokedCommands = finalState.invocations!.map((inv) =>
-      `${inv.command} ${inv.args[0] || ''}`.trim(),
-    )
-    expect(invokedCommands).toContain('workspace create')
-    expect(invokedCommands).toContain('agent start')
-    expect(invokedCommands.some((c) => c.startsWith('worktree'))).toBe(false)
-    expect(invokedCommands.some((c) => c.startsWith('pane'))).toBe(false)
+    const singleAgent = getHerdrAgent(binDir, statePath, 'worker-a')
+    expect(singleAgent).toBeDefined()
+    expect(singleAgent?.name).toBe('worker-a')
 
     await rm(dir, { recursive: true, force: true })
   })
@@ -475,8 +527,8 @@ export default async function (drovr: Drovr) {
       },
     })
 
-    const finalState: MockHerdrState = JSON.parse(await readFile(statePath, 'utf8'))
-    expect(finalState.invocations).toHaveLength(0)
+    expect(listHerdrWorkspaces(binDir, statePath)).toHaveLength(0)
+    expect(listHerdrAgents(binDir, statePath)).toHaveLength(0)
 
     await rm(dir, { recursive: true, force: true })
   })
@@ -527,23 +579,18 @@ export default async function (drovr: Drovr) {
     expect(errInfo.status).toBe(1)
     expect(errInfo.stderr).toContain('Simulated OMP startup crash')
 
-    const finalState: MockHerdrState = JSON.parse(await readFile(statePath, 'utf8'))
-
     // item-a succeeded: its workspace and agent remain
-    expect(finalState.agents).toHaveLength(1)
-    expect(finalState.agents![0].name).toBe('item-a')
+    const workspaces = listHerdrWorkspaces(binDir, statePath)
+    expect(workspaces).toHaveLength(1)
+    expect(workspaces[0].label).toBe('item-a')
 
-    expect(finalState.workspaces).toHaveLength(1)
-    expect(finalState.workspaces![0].label).toBe('item-a')
+    const agents = listHerdrAgents(binDir, statePath)
+    expect(agents).toHaveLength(1)
+    expect(agents[0].name).toBe('item-a')
 
-    // item-b's attempt-created workspace was closed upon failure
-    const closedCalls = finalState.invocations!.filter(
-      (inv) => inv.command === 'workspace' && inv.args[0] === 'close',
-    )
-    expect(closedCalls).toHaveLength(1)
-    const closedWorkspaceId = closedCalls[0].args[1]
-    expect(closedWorkspaceId).toBeDefined()
-    expect(closedWorkspaceId).not.toBe(finalState.workspaces![0].workspace_id)
+    // item-b's agent does not exist and its attempt-created workspace was closed
+    expect(getHerdrAgent(binDir, statePath, 'item-b')).toBeNull()
+
     await rm(dir, { recursive: true, force: true })
   })
 
@@ -591,20 +638,14 @@ export default async function (drovr: Drovr) {
       },
     })
 
-    const finalState: MockHerdrState = JSON.parse(await readFile(statePath, 'utf8'))
+    // Exactly one winner workspace and agent remain in Herdr
+    const workspaces = listHerdrWorkspaces(binDir, statePath)
+    expect(workspaces).toHaveLength(1)
+    expect(workspaces[0].label).toBe('same-name')
 
-    // Only the winner's workspace and agent remain
-    expect(finalState.agents).toHaveLength(1)
-    expect(finalState.agents![0].name).toBe('same-name')
-
-    expect(finalState.workspaces).toHaveLength(1)
-    expect(finalState.workspaces![0].label).toBe('same-name')
-
-    // The loser's attempt-created workspace was closed
-    const closedCalls = finalState.invocations!.filter(
-      (inv) => inv.command === 'workspace' && inv.args[0] === 'close',
-    )
-    expect(closedCalls).toHaveLength(1)
+    const agents = listHerdrAgents(binDir, statePath)
+    expect(agents).toHaveLength(1)
+    expect(agents[0].name).toBe('same-name')
 
     await rm(dir, { recursive: true, force: true })
   })
@@ -637,23 +678,18 @@ export default async function (drovr: Drovr) {
       },
     })
 
-    // After CLI exit (status 0), inspect external Herdr state
-    const finalState: MockHerdrState = JSON.parse(await readFile(statePath, 'utf8'))
+    // After CLI exit (status 0), query Herdr state via CLI
+    const workspaces = listHerdrWorkspaces(binDir, statePath)
+    expect(workspaces).toHaveLength(1)
+    expect(workspaces[0].label).toBe('surviving-worker')
 
-    // Workspaces and agent are still alive
-    expect(finalState.workspaces).toHaveLength(1)
-    expect(finalState.workspaces![0].label).toBe('surviving-worker')
-    expect(finalState.agents).toHaveLength(1)
-    expect(finalState.agents![0].name).toBe('surviving-worker')
-
-    // No workspace close or agent kill commands were called
-    const closeCalls = finalState.invocations!.filter(
-      (inv) => inv.command === 'workspace' && inv.args[0] === 'close',
-    )
-    expect(closeCalls).toHaveLength(0)
+    const agents = listHerdrAgents(binDir, statePath)
+    expect(agents).toHaveLength(1)
+    expect(agents[0].name).toBe('surviving-worker')
 
     await rm(dir, { recursive: true, force: true })
   })
+
   it('starts multiple Workers concurrently across map items each in its own Worktree workspace', async () => {
     const dir = await initRepo()
     const { binDir, statePath } = await setupMockHerdr(dir)
@@ -689,21 +725,20 @@ export default async function (drovr: Drovr) {
       },
     })
 
-    const finalState: MockHerdrState = JSON.parse(await readFile(statePath, 'utf8'))
+    const workspaces = listHerdrWorkspaces(binDir, statePath)
+    expect(workspaces).toHaveLength(3)
 
-    expect(finalState.workspaces).toHaveLength(3)
-    expect(finalState.agents).toHaveLength(3)
+    const agents = listHerdrAgents(binDir, statePath)
+    expect(agents).toHaveLength(3)
 
-    const wsLabels = finalState
-      .workspaces!.map((w) => w.label || '')
-      .sort((a, b) => a.localeCompare(b))
+    const wsLabels = workspaces.map((w) => w.label || '').sort((a, b) => a.localeCompare(b))
     expect(wsLabels).toEqual(['worker-1', 'worker-2', 'worker-3'])
 
-    const agentNames = finalState.agents!.map((a) => a.name).sort((a, b) => a.localeCompare(b))
+    const agentNames = agents.map((a) => a.name).sort((a, b) => a.localeCompare(b))
     expect(agentNames).toEqual(['worker-1', 'worker-2', 'worker-3'])
 
-    for (const agent of finalState.agents!) {
-      const matchingWs = finalState.workspaces!.find((w) => w.label === agent.name)
+    for (const agent of agents) {
+      const matchingWs = workspaces.find((w) => w.label === agent.name)
       expect(matchingWs).toBeDefined()
       expect(agent.pane_id).toBe(matchingWs!.root_pane.pane_id)
       expect(agent.cwd).toBe(join(dir, '.worktrees', agent.name))
@@ -750,14 +785,8 @@ export default async function (drovr: Drovr) {
     expect(errInfo.status).toBe(1)
     expect(errInfo.stderr).toContain('Simulated socket connection error during workspace creation')
 
-    const finalState: MockHerdrState = JSON.parse(await readFile(statePath, 'utf8'))
-    expect(finalState.workspaces).toHaveLength(0)
-    expect(finalState.agents).toHaveLength(0)
-
-    const closeCalls = finalState.invocations!.filter(
-      (inv) => inv.command === 'workspace' && inv.args[0] === 'close',
-    )
-    expect(closeCalls).toHaveLength(0)
+    expect(listHerdrWorkspaces(binDir, statePath)).toHaveLength(0)
+    expect(listHerdrAgents(binDir, statePath)).toHaveLength(0)
 
     await rm(dir, { recursive: true, force: true })
   })

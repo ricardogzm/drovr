@@ -22,7 +22,7 @@ import {
   safeRealpath,
 } from './git'
 import { runWorktreeSetup } from './worktree-setup'
-import { closeHerdrWorkspace, createHerdrWorkspace, startHerdrAgent } from './herdr'
+import { closeHerdrWorkspace, createHerdrWorkspace, startHerdrOmpWorker } from './herdr'
 import type { Drovr, Issue, Name, Worker, Worktree } from './index'
 import type { DrovrLogger, DrovrLoggerCounts } from './log'
 import { mergeExactLine } from './merge-line'
@@ -401,15 +401,14 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
       const targetCwd = opts.cwd
 
       const { workspaceId, rootPaneId } = createHerdrWorkspace(workingDir, {
-        cwd: targetCwd,
+        workspaceCwd: targetCwd,
         label: name,
         noFocus: true,
       })
 
       try {
-        startHerdrAgent(workingDir, {
+        startHerdrOmpWorker(workingDir, {
           name,
-          kind: 'omp',
           paneId: rootPaneId,
         })
       } catch (err) {

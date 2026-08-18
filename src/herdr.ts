@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process'
+import type { Name } from './index'
 
 export interface HerdrWorkspaceResult {
   workspaceId: string
@@ -30,17 +31,17 @@ export function runHerdr(cwd: string, args: string[]): string {
 }
 
 export function createHerdrWorkspace(
-  cwd: string,
-  options: { cwd: string; label?: string; noFocus?: boolean },
+  commandCwd: string,
+  options: { workspaceCwd: string; label?: string; noFocus?: boolean },
 ): HerdrWorkspaceResult {
-  const args = ['workspace', 'create', '--cwd', options.cwd]
+  const args = ['workspace', 'create', '--cwd', options.workspaceCwd]
   if (options.label) {
     args.push('--label', options.label)
   }
   if (options.noFocus) {
     args.push('--no-focus')
   }
-  const output = runHerdr(cwd, args)
+  const output = runHerdr(commandCwd, args)
   try {
     const data: unknown = JSON.parse(output)
     if (typeof data === 'object' && data !== null) {
@@ -88,17 +89,13 @@ export function createHerdrWorkspace(
   throw new Error(`failed to parse workspace create output: ${output}`)
 }
 
-export function closeHerdrWorkspace(cwd: string, workspaceId: string): void {
-  runHerdr(cwd, ['workspace', 'close', workspaceId])
+export function closeHerdrWorkspace(commandCwd: string, workspaceId: string): void {
+  runHerdr(commandCwd, ['workspace', 'close', workspaceId])
 }
 
-export function startHerdrAgent(
-  cwd: string,
-  options: { name: string; kind: string; paneId: string; ompArgs?: string[] },
+export function startHerdrOmpWorker(
+  commandCwd: string,
+  options: { name: Name; paneId: string },
 ): void {
-  const args = ['agent', 'start', options.name, '--kind', options.kind, '--pane', options.paneId]
-  if (options.ompArgs && options.ompArgs.length > 0) {
-    args.push('--', ...options.ompArgs)
-  }
-  runHerdr(cwd, args)
+  runHerdr(commandCwd, ['agent', 'start', options.name, '--kind', 'omp', '--pane', options.paneId])
 }
