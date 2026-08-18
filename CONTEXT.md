@@ -28,9 +28,17 @@ _Avoid_: main working tree (unless it is also the launch directory)
 A second git checkout of the same repository, keyed by Name, that isolates a Worker's files from the Start checkout.
 _Avoid_: sandbox, clone (as the isolation unit)
 
+**Worktree setup**:
+The repository-defined preparation Drovr must finish after physically creating a Worktree and before its Worker may start.
+_Avoid_: dependency installation (too narrow), Task
+
 **Resource**:
 A named, capacity-limited lock Drovr leases so scarce environments are not used in parallel. Capacity is defined before the first lease.
 _Avoid_: mutex, semaphore (as the domain name)
+
+**Port Resource**:
+A Resource whose capacity-one Lease reserves an entire declared set of local TCP ports. Operating-system availability is informational and does not gate acquisition.
+_Avoid_: port pool, allocated port
 
 **Lease**:
 One Name occupying one slot of a Resource.
