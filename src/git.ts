@@ -25,7 +25,8 @@ export function resolveGitDir(cwd: string): string {
 
 export function resolveGitCommonDir(cwd: string): string {
   const gitCommonDir = runGit(cwd, ['rev-parse', '--git-common-dir'])
-  return gitCommonDir.startsWith('/') ? gitCommonDir : `${cwd}/${gitCommonDir}`
+  const resolved = isAbsolute(gitCommonDir) ? gitCommonDir : resolve(cwd, gitCommonDir)
+  return safeRealpath(resolved)
 }
 
 export function isGitCheckoutDirty(cwd: string): boolean {
@@ -61,6 +62,32 @@ export function isGitBranchPresent(cwd: string, branchName: string): boolean {
   throw new Error(`git show-ref failed with exit code ${result.status}: ${result.stderr.trim()}`)
 }
 
+export function getGitWorktreeBranch(cwd: string): string | null {
+  const result = spawnSync('git', ['symbolic-ref', '--short', 'HEAD'], {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  if (result.status === 0) {
+    return result.stdout.replace(/\r?\n$/, '')
+  }
+  return null
+}
+
+export function isGitWorktreeOfRepository(worktreePath: string, repositoryDir: string): boolean {
+  try {
+    const wtRoot = runGit(worktreePath, ['rev-parse', '--show-toplevel'])
+    if (safeRealpath(wtRoot) !== safeRealpath(worktreePath)) {
+      return false
+    }
+    const wtCommon = resolveGitCommonDir(worktreePath)
+    const repoCommon = resolveGitCommonDir(repositoryDir)
+    return wtCommon === repoCommon
+  } catch {
+    return false
+  }
+}
+
 export function isBeneathManagedWorktrees(cwd: string, root: string): boolean {
   const output = execFileSync('git', ['worktree', 'list', '--porcelain', '-z'], {
     cwd,
@@ -93,7 +120,7 @@ export function isBeneathManagedWorktrees(cwd: string, root: string): boolean {
   return false
 }
 
-function safeRealpath(p: string): string {
+export function safeRealpath(p: string): string {
   try {
     return realpathSync(p)
   } catch (err) {

@@ -345,48 +345,6 @@ export default async function workflow(drovr: Drovr): Promise<void> {
     }
   })
 
-  it('rejects worktree creation during resume mode before any exclude or git mutation', async () => {
-    const repo = await initRepo()
-
-    try {
-      await mkdir(join(repo, '.drovr'), { recursive: true })
-      // First create starter main.ts that does not call worktree so fresh start initializes project db
-      await writeFile(
-        join(repo, '.drovr/main.ts'),
-        `import type { Drovr } from "drovr"
-
-export default async function workflow(drovr: Drovr): Promise<void> {}
-`,
-        'utf8',
-      )
-      execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })
-
-      // Now update main.ts to call worktree during resume
-      await writeFile(
-        join(repo, '.drovr/main.ts'),
-        `import type { Drovr } from "drovr"
-
-export default async function workflow(drovr: Drovr): Promise<void> {
-  await drovr.worktree({ name: 'resume-attempt' })
-}
-`,
-        'utf8',
-      )
-
-      expect(() =>
-        execFileSync('node', [drovr, 'start', '--resume'], { cwd: repo, stdio: 'pipe' }),
-      ).toThrow(/worktree resume/i)
-
-      // No branch, worktree directory, or exclude entry was created
-      expect(() =>
-        runGit(repo, ['rev-parse', '--verify', 'refs/heads/drovr/resume-attempt']),
-      ).toThrow(/Command failed/)
-      expect(existsSync(join(repo, '.worktrees', 'resume-attempt'))).toBe(false)
-    } finally {
-      await rm(repo, { recursive: true, force: true })
-    }
-  })
-
   it('detects managed worktrees beneath external linked Start checkouts and symlinks', async () => {
     const repo = await initRepo()
     const externalLinked = await mkdtemp(join(tmpdir(), 'drovr-ext-linked-'))
@@ -600,6 +558,491 @@ export default async function workflow(drovr: Drovr): Promise<void> {
       })
       expect(proc.status).toBe(0)
       expect(proc.stderr).toMatch(/warning.*uncommitted/i)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('Issue #27: Drovr.worktree resume reconnect and repair', () => {
+  it('preserves matching dirty Worktree in place with uncommitted files untouched on resume', async () => {
+    const repo = await initRepo()
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+
+export default async function workflow(drovr: Drovr): Promise<void> {
+  const wt = await drovr.worktree({ name: 'dirty-resume' })
+  // In pass 1, record uncommitted changes
+  const pass = await (async () => {
+    try {
+      const { readFile } = await import('node:fs/promises')
+      const { join } = await import('node:path')
+      return (await readFile(join(${JSON.stringify(repo)}, 'pass.txt'), 'utf8')).trim()
+    } catch {
+      return '1'
+    }
+  })()
+
+  if (pass === '1') {
+    const { writeFile } = await import('node:fs/promises')
+    const { join } = await import('node:path')
+    // Modify existing tracked file
+    await writeFile(join(wt.path, 'source.txt'), 'modified in worktree\\n', 'utf8')
+    // Create new untracked file
+    await writeFile(join(wt.path, 'untracked.txt'), 'untracked content\\n', 'utf8')
+    // Create new file and stage it
+    await writeFile(join(wt.path, 'staged.txt'), 'staged content\\n', 'utf8')
+    const { execFileSync } = await import('node:child_process')
+    execFileSync('git', ['add', 'staged.txt'], { cwd: wt.path })
+    // Throw to simulate failure/interruption before completing
+    throw new Error('simulated crash in pass 1')
+  }
+
+  // Pass 2 (resume): verify worktree identity and uncommitted files
+  const { readFile, writeFile } = await import('node:fs/promises')
+  const { join } = await import('node:path')
+  const source = await readFile(join(wt.path, 'source.txt'), 'utf8')
+  if (source !== 'modified in worktree\\n') {
+    throw new Error('source.txt was modified/reset: ' + source)
+  }
+  const untracked = await readFile(join(wt.path, 'untracked.txt'), 'utf8')
+  if (untracked !== 'untracked content\\n') {
+    throw new Error('untracked.txt was modified: ' + untracked)
+  }
+  const staged = await readFile(join(wt.path, 'staged.txt'), 'utf8')
+  if (staged !== 'staged content\\n') {
+    throw new Error('staged.txt was modified: ' + staged)
+  }
+  await writeFile(join(${JSON.stringify(repo)}, 'resume-success.txt'), 'ok\\n', 'utf8')
+}
+`,
+        'utf8',
+      )
+
+      // Pass 1: fresh start fails
+      expect(() => execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })).toThrow(
+        /simulated crash in pass 1/,
+      )
+
+      const worktreePath = join(repo, '.worktrees', 'dirty-resume')
+      expect(existsSync(worktreePath)).toBe(true)
+
+      // Set pass 2
+      await writeFile(join(repo, 'pass.txt'), '2', 'utf8')
+
+      // Pass 2: resume
+      execFileSync('node', [drovr, 'start', '--resume'], { cwd: repo, stdio: 'pipe' })
+
+      expect(existsSync(join(repo, 'resume-success.txt'))).toBe(true)
+
+      // Verify git status in worktree still has staged, modified, and untracked files
+      const wtStatus = runGit(worktreePath, ['status', '--porcelain'])
+      expect(wtStatus).toContain('M source.txt')
+      expect(wtStatus).toContain('A  staged.txt')
+      expect(wtStatus).toContain('?? untracked.txt')
+
+      // Verify branch is still drovr/dirty-resume
+      const currentBranch = runGit(worktreePath, ['symbolic-ref', '--short', 'HEAD'])
+      expect(currentBranch).toBe('drovr/dirty-resume')
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('recreates missing Worktree directory on surviving derived branch after stale git metadata repair', async () => {
+    const repo = await initRepo()
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+
+export default async function workflow(drovr: Drovr): Promise<void> {
+  const wt = await drovr.worktree({ name: 'recreate-branch' })
+  const pass = await (async () => {
+    try {
+      const { readFile } = await import('node:fs/promises')
+      const { join } = await import('node:path')
+      return (await readFile(join(${JSON.stringify(repo)}, 'pass.txt'), 'utf8')).trim()
+    } catch {
+      return '1'
+    }
+  })()
+
+  if (pass === '1') {
+    const { writeFile } = await import('node:fs/promises')
+    const { join } = await import('node:path')
+    const { execFileSync } = await import('node:child_process')
+    // Commit a file on the branch
+    await writeFile(join(wt.path, 'branch-step.txt'), 'step 1 committed\\n', 'utf8')
+    execFileSync('git', ['add', 'branch-step.txt'], { cwd: wt.path })
+    execFileSync('git', ['commit', '-m', 'commit step 1'], { cwd: wt.path })
+    throw new Error('crash after commit')
+  }
+
+  // Pass 2: verify recreated worktree has surviving branch history
+  const { readFile, writeFile } = await import('node:fs/promises')
+  const { join } = await import('node:path')
+  const content = await readFile(join(wt.path, 'branch-step.txt'), 'utf8')
+  if (content !== 'step 1 committed\\n') {
+    throw new Error('branch commit missing in recreated worktree')
+  }
+  await writeFile(join(${JSON.stringify(repo)}, 'recreated-ok.txt'), 'done\\n', 'utf8')
+}
+`,
+        'utf8',
+      )
+
+      // Pass 1: fresh start creates worktree and commits on branch, then crashes
+      expect(() => execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })).toThrow(
+        /crash after commit/,
+      )
+
+      const worktreePath = join(repo, '.worktrees', 'recreate-branch')
+      expect(existsSync(worktreePath)).toBe(true)
+
+      // Simulate complete loss/deletion of worktree directory while branch survives
+      await rm(worktreePath, { recursive: true, force: true })
+      expect(existsSync(worktreePath)).toBe(false)
+
+      // Stale git metadata still exists before resume
+      const rawList = runGit(repo, ['worktree', 'list', '--porcelain'])
+      expect(rawList).toContain('recreate-branch')
+
+      // Set pass 2
+      await writeFile(join(repo, 'pass.txt'), '2', 'utf8')
+
+      // Pass 2: resume reconnects by pruning stale metadata and recreating worktree on surviving branch
+      execFileSync('node', [drovr, 'start', '--resume'], { cwd: repo, stdio: 'pipe' })
+
+      expect(existsSync(join(repo, 'recreated-ok.txt'))).toBe(true)
+      expect(existsSync(worktreePath)).toBe(true)
+      expect(await readFile(join(worktreePath, 'branch-step.txt'), 'utf8')).toBe(
+        'step 1 committed\n',
+      )
+
+      // Verify worktree is linked to repository and on drovr/recreate-branch
+      const wtTopLevel = runGit(worktreePath, ['rev-parse', '--show-toplevel'])
+      expect(wtTopLevel).toBe(worktreePath)
+      const wtBranch = runGit(worktreePath, ['symbolic-ref', '--short', 'HEAD'])
+      expect(wtBranch).toBe('drovr/recreate-branch')
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('fails when present directory is foreign and does not delete, adopt, or mutate it', async () => {
+    const repo = await initRepo()
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      // Run starter workflow once to initialize project database
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+export default async function workflow(drovr: Drovr): Promise<void> {}
+`,
+        'utf8',
+      )
+      execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })
+
+      // Scenario A: Plain foreign directory with uncommitted content
+      const foreignDir = join(repo, '.worktrees', 'foreign-dir')
+      await mkdir(foreignDir, { recursive: true })
+      await writeFile(join(foreignDir, 'foreign-data.txt'), 'precious data\n', 'utf8')
+
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+export default async function workflow(drovr: Drovr): Promise<void> {
+  await drovr.worktree({ name: 'foreign-dir' })
+}
+`,
+        'utf8',
+      )
+
+      expect(() =>
+        execFileSync('node', [drovr, 'start', '--resume'], { cwd: repo, stdio: 'pipe' }),
+      ).toThrow(/foreign/i)
+
+      // Foreign directory and files MUST NOT be deleted, adopted, or modified
+      expect(existsSync(foreignDir)).toBe(true)
+      expect(await readFile(join(foreignDir, 'foreign-data.txt'), 'utf8')).toBe('precious data\n')
+      expect(() => runGit(repo, ['rev-parse', '--verify', 'refs/heads/drovr/foreign-dir'])).toThrow(
+        /Command failed/,
+      )
+
+      // Scenario B: Independent foreign git repository
+      const foreignGit = join(repo, '.worktrees', 'foreign-git')
+      await mkdir(foreignGit, { recursive: true })
+      runGit(foreignGit, ['init', '-b', 'drovr/foreign-git'])
+      await writeFile(join(foreignGit, 'repo-file.txt'), 'repo file\n', 'utf8')
+
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+export default async function workflow(drovr: Drovr): Promise<void> {
+  await drovr.worktree({ name: 'foreign-git' })
+}
+`,
+        'utf8',
+      )
+
+      expect(() =>
+        execFileSync('node', [drovr, 'start', '--resume'], { cwd: repo, stdio: 'pipe' }),
+      ).toThrow(/foreign/i)
+
+      expect(existsSync(foreignGit)).toBe(true)
+      expect(await readFile(join(foreignGit, 'repo-file.txt'), 'utf8')).toBe('repo file\n')
+
+      // Scenario C: Plain file at derived worktree location
+      const foreignFile = join(repo, '.worktrees', 'foreign-file')
+      await writeFile(foreignFile, 'just a file\n', 'utf8')
+
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+export default async function workflow(drovr: Drovr): Promise<void> {
+  await drovr.worktree({ name: 'foreign-file' })
+}
+`,
+        'utf8',
+      )
+
+      expect(() =>
+        execFileSync('node', [drovr, 'start', '--resume'], { cwd: repo, stdio: 'pipe' }),
+      ).toThrow(/foreign|directory/i)
+
+      expect(existsSync(foreignFile)).toBe(true)
+      expect(await readFile(foreignFile, 'utf8')).toBe('just a file\n')
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('fails when matching repository Worktree is on the wrong branch and does not switch branches or mutate files', async () => {
+    const repo = await initRepo()
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      // Run starter workflow to initialize db
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+export default async function workflow(drovr: Drovr): Promise<void> {}
+`,
+        'utf8',
+      )
+      execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })
+
+      // Scenario A: Linked worktree on other-branch
+      const wtWrong = join(repo, '.worktrees', 'wrong-branch')
+      runGit(repo, ['worktree', 'add', '-b', 'other-branch', wtWrong, 'HEAD'])
+      await writeFile(join(wtWrong, 'unrelated.txt'), 'unrelated work\n', 'utf8')
+
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+export default async function workflow(drovr: Drovr): Promise<void> {
+  await drovr.worktree({ name: 'wrong-branch' })
+}
+`,
+        'utf8',
+      )
+
+      expect(() =>
+        execFileSync('node', [drovr, 'start', '--resume'], { cwd: repo, stdio: 'pipe' }),
+      ).toThrow(/branch/i)
+
+      // Worktree must still be on other-branch and unmodified
+      const currentBranch = runGit(wtWrong, ['symbolic-ref', '--short', 'HEAD'])
+      expect(currentBranch).toBe('other-branch')
+      expect(await readFile(join(wtWrong, 'unrelated.txt'), 'utf8')).toBe('unrelated work\n')
+
+      // Scenario B: Linked worktree in detached HEAD state
+      const wtDetached = join(repo, '.worktrees', 'detached-item')
+      runGit(repo, ['worktree', 'add', '-b', 'drovr/detached-item', wtDetached, 'HEAD'])
+      runGit(wtDetached, ['checkout', '--detach', 'HEAD'])
+
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+export default async function workflow(drovr: Drovr): Promise<void> {
+  await drovr.worktree({ name: 'detached-item' })
+}
+`,
+        'utf8',
+      )
+
+      expect(() =>
+        execFileSync('node', [drovr, 'start', '--resume'], { cwd: repo, stdio: 'pipe' }),
+      ).toThrow(/branch|detached/i)
+
+      expect(() => runGit(wtDetached, ['symbolic-ref', '--short', 'HEAD'])).toThrow(
+        /Command failed/,
+      )
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('fails when both Worktree directory and derived branch are lost without creating a fresh branch or path', async () => {
+    const repo = await initRepo()
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+export default async function workflow(drovr: Drovr): Promise<void> {}
+`,
+        'utf8',
+      )
+      execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })
+
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+export default async function workflow(drovr: Drovr): Promise<void> {
+  await drovr.worktree({ name: 'lost-both' })
+}
+`,
+        'utf8',
+      )
+
+      expect(() =>
+        execFileSync('node', [drovr, 'start', '--resume'], { cwd: repo, stdio: 'pipe' }),
+      ).toThrow(/neither path.*nor branch.*exists/i)
+
+      // No branch or worktree directory created
+      expect(() => runGit(repo, ['rev-parse', '--verify', 'refs/heads/drovr/lost-both'])).toThrow(
+        /Command failed/,
+      )
+      expect(existsSync(join(repo, '.worktrees', 'lost-both'))).toBe(false)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('handles multi-item resumed workflow combining skipped completed items, matching dirty reconnect, and missing directory repair', async () => {
+    const repo = await initRepo()
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+
+export default async function workflow(drovr: Drovr): Promise<void> {
+  const pass = await (async () => {
+    try {
+      const { readFile } = await import('node:fs/promises')
+      const { join } = await import('node:path')
+      return (await readFile(join(${JSON.stringify(repo)}, 'pass.txt'), 'utf8')).trim()
+    } catch {
+      return '1'
+    }
+  })()
+
+  await drovr.map(
+    ['item-one', 'item-two', 'item-three'],
+    { concurrency: 1, name: (x) => x },
+    async (item) => {
+      const wt = await drovr.worktree({ name: item })
+      const { readFile, writeFile } = await import('node:fs/promises')
+      const { join } = await import('node:path')
+      const { execFileSync } = await import('node:child_process')
+
+      if (pass === '1') {
+        if (item === 'item-one') {
+          // item-one succeeds and completes
+          await writeFile(join(wt.path, 'result.txt'), 'item-one-done\\n', 'utf8')
+          return
+        }
+        if (item === 'item-two') {
+          // item-two makes dirty change and throws
+          await writeFile(join(wt.path, 'dirty-two.txt'), 'dirty content two\\n', 'utf8')
+          throw new Error('item-two interrupted in pass 1')
+        }
+        if (item === 'item-three') {
+          // item-three commits on branch and throws
+          await writeFile(join(wt.path, 'committed-three.txt'), 'step 3 commit\\n', 'utf8')
+          execFileSync('git', ['add', 'committed-three.txt'], { cwd: wt.path })
+          execFileSync('git', ['commit', '-m', 'commit three'], { cwd: wt.path })
+          throw new Error('item-three interrupted in pass 1')
+        }
+      }
+
+      // Pass 2 (resume):
+      if (item === 'item-one') {
+        throw new Error('item-one should have been skipped on resume!')
+      }
+      if (item === 'item-two') {
+        const dirtyContent = await readFile(join(wt.path, 'dirty-two.txt'), 'utf8')
+        if (dirtyContent !== 'dirty content two\\n') {
+          throw new Error('item-two dirty content missing: ' + dirtyContent)
+        }
+        return
+      }
+      if (item === 'item-three') {
+        const branchContent = await readFile(join(wt.path, 'committed-three.txt'), 'utf8')
+        if (branchContent !== 'step 3 commit\\n') {
+          throw new Error('item-three branch content missing: ' + branchContent)
+        }
+        return
+      }
+    }
+  )
+}
+`,
+        'utf8',
+      )
+
+      // Pass 1: map starts, item-one completes, item-two fails
+      expect(() => execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })).toThrow(
+        /map items failed: item-two/i,
+      )
+
+      const wt3Path = join(repo, '.worktrees', 'item-three')
+      expect(existsSync(wt3Path)).toBe(true)
+      await rm(wt3Path, { recursive: true, force: true })
+
+      // Set pass 2
+      await writeFile(join(repo, 'pass.txt'), '2', 'utf8')
+
+      // Pass 2: resume
+      execFileSync('node', [drovr, 'start', '--resume'], { cwd: repo, stdio: 'pipe' })
+
+      // Check log
+      const logContent = await readFile(join(repo, '.drovr/drovr.log'), 'utf8')
+      const resumeLines = logContent
+        .trim()
+        .split('\n')
+        .filter((l) => l.includes('mode=resume') || l.includes('name=item-'))
+
+      // item-one was skipped
+      expect(
+        resumeLines.some((l) => l.includes('map.item.skip') && l.includes('name=item-one')),
+      ).toBe(true)
+      // item-two was re-run and completed
+      expect(
+        resumeLines.some((l) => l.includes('map.item.start') && l.includes('name=item-two')),
+      ).toBe(true)
+      expect(
+        resumeLines.some((l) => l.includes('map.item.complete') && l.includes('name=item-two')),
+      ).toBe(true)
+      // item-three was re-run and completed
+      expect(
+        resumeLines.some((l) => l.includes('map.item.start') && l.includes('name=item-three')),
+      ).toBe(true)
+      expect(
+        resumeLines.some((l) => l.includes('map.item.complete') && l.includes('name=item-three')),
+      ).toBe(true)
     } finally {
       await rm(repo, { recursive: true, force: true })
     }

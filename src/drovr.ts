@@ -10,7 +10,14 @@ import {
   normalizeIssue,
   viewIssue,
 } from './gh'
-import { isGitBranchPresent, isGitCheckoutDirty, resolveGitCommonDir, runGit } from './git'
+import {
+  getGitWorktreeBranch,
+  isGitBranchPresent,
+  isGitCheckoutDirty,
+  isGitWorktreeOfRepository,
+  resolveGitCommonDir,
+  runGit,
+} from './git'
 import type { Drovr, Issue, Name, Worktree } from './index'
 import type { DrovrLogger, DrovrLoggerCounts } from './log'
 import { mergeExactLine } from './merge-line'
@@ -202,14 +209,58 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
         )
       }
 
-      if (mode === 'resume') {
-        throw new Error('worktree resume is not implemented yet')
-      }
-
       const name = opts.name
       const branchName = `drovr/${name}`
       const worktreePath = join(workingDir, '.worktrees', name)
 
+      if (mode === 'resume') {
+        const directoryExists = await entryExists(worktreePath)
+        const branchExists = isGitBranchPresent(workingDir, branchName)
+
+        if (!directoryExists) {
+          if (!branchExists) {
+            throw new Error(
+              `Cannot resume Worktree "${name}": neither path "${worktreePath}" nor branch "${branchName}" exists.`,
+            )
+          }
+
+          await ensureCloneLocalWorktreeExclusion(workingDir)
+          runGit(workingDir, ['worktree', 'prune'])
+          runGit(workingDir, ['worktree', 'add', worktreePath, branchName])
+
+          return Object.freeze({
+            name,
+            path: worktreePath,
+          })
+        }
+
+        const stat = await lstat(worktreePath).catch(() => null)
+        if (!stat || !stat.isDirectory()) {
+          throw new Error(
+            `Cannot resume Worktree "${name}": path "${worktreePath}" is a foreign file or invalid directory.`,
+          )
+        }
+
+        if (!isGitWorktreeOfRepository(worktreePath, workingDir)) {
+          throw new Error(
+            `Cannot resume Worktree "${name}": path "${worktreePath}" is a foreign directory or not a Worktree of this repository.`,
+          )
+        }
+
+        const currentBranch = getGitWorktreeBranch(worktreePath)
+        if (currentBranch !== branchName) {
+          throw new Error(
+            `Cannot resume Worktree "${name}": Worktree at "${worktreePath}" is on branch "${currentBranch ?? 'detached HEAD'}", expected "${branchName}".`,
+          )
+        }
+
+        await ensureCloneLocalWorktreeExclusion(workingDir)
+
+        return Object.freeze({
+          name,
+          path: worktreePath,
+        })
+      }
       const branchExists = isGitBranchPresent(workingDir, branchName)
       const directoryExists = await entryExists(worktreePath)
 
