@@ -27,35 +27,50 @@ const DEFAULT_COUNTS: DrovrLoggerCounts = {
   failed: 0,
 }
 function formatErrorMessage(error: unknown): string {
-  if (error instanceof Error) {
-    return error.message
-  }
-  if (typeof error === 'string') {
-    return error
-  }
-  if (typeof error === 'bigint') {
-    return `${error.toString()}n`
-  }
-  if (error === undefined) {
-    return 'unknown error'
-  }
-  if (error === null) {
-    return 'null'
-  }
   try {
-    const serialized = JSON.stringify(error)
-    if (serialized !== undefined) {
-      return serialized
+    if (error instanceof Error) {
+      try {
+        if (typeof error.message === 'string') {
+          return error.message
+        }
+      } catch {}
     }
-  } catch {
-    // Non-serializable object (e.g. circular structure)
-  }
-  if (typeof error === 'object') {
-    return Object.prototype.toString.call(error)
-  }
-  if (typeof error === 'function' || typeof error === 'symbol') {
-    return error.toString()
-  }
+    if (typeof error === 'string') {
+      return error
+    }
+    if (typeof error === 'number') {
+      return String(error)
+    }
+    if (typeof error === 'boolean') {
+      return error ? 'true' : 'false'
+    }
+    if (typeof error === 'bigint') {
+      return `${BigInt.prototype.toString.call(error)}n`
+    }
+    if (error === undefined) {
+      return 'unknown error'
+    }
+    if (error === null) {
+      return 'null'
+    }
+    try {
+      const serialized = JSON.stringify(error)
+      if (serialized !== undefined) {
+        return serialized
+      }
+    } catch {}
+    try {
+      if (typeof error === 'object') {
+        return Object.prototype.toString.call(error)
+      }
+      if (typeof error === 'function') {
+        return Function.prototype.toString.call(error)
+      }
+      if (typeof error === 'symbol') {
+        return Symbol.prototype.toString.call(error)
+      }
+    } catch {}
+  } catch {}
   return 'unknown error'
 }
 
