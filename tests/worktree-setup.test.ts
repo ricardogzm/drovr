@@ -646,7 +646,9 @@ export default async function workflow(drovr: Drovr): Promise<void> {
       await mkdir(join(repo, '.drovr'), { recursive: true })
       await writeFile(
         join(repo, '.drovr', 'worktrees.json'),
-        JSON.stringify(['echo "about to kill" && kill -TERM $$']),
+        JSON.stringify([
+          'echo "about to kill" >> setup.log && echo "about to kill" && kill -TERM $$',
+        ]),
         'utf8',
       )
       runGit(repo, ['add', '.drovr/worktrees.json'])
@@ -655,9 +657,12 @@ export default async function workflow(drovr: Drovr): Promise<void> {
       await writeFile(
         join(repo, '.drovr/main.ts'),
         `import type { Drovr } from "drovr"
+import { writeFile } from "node:fs/promises"
+import { join } from "node:path"
 
 export default async function workflow(drovr: Drovr): Promise<void> {
-  await drovr.worktree({ name: 'signal-item' })
+  const wt = await drovr.worktree({ name: 'signal-item' })
+  await writeFile(join(${JSON.stringify(repo)}, 'workflow-success.txt'), 'ok\\n', 'utf8')
 }
 `,
         'utf8',
@@ -679,6 +684,33 @@ export default async function workflow(drovr: Drovr): Promise<void> {
       // Physical Worktree remains intact
       const worktreePath = join(repo, '.worktrees', 'signal-item')
       expect(existsSync(worktreePath)).toBe(true)
+      expect(await readFile(join(worktreePath, 'setup.log'), 'utf8')).toBe('about to kill\n')
+
+      // Replace current setup config in worktree with new multi-command array
+      await writeFile(
+        join(worktreePath, '.drovr', 'worktrees.json'),
+        JSON.stringify(['echo pass2-cmd1 >> setup.log', 'echo pass2-cmd2 >> setup.log']),
+        'utf8',
+      )
+
+      // Pass 2: resume reruns setup from command one with current configuration
+      const proc2 = spawnSync('node', [drovr, 'start', '--resume'], {
+        cwd: repo,
+        encoding: 'utf8',
+      })
+      expect(proc2.status).toBe(0)
+      expect(existsSync(join(repo, 'workflow-success.txt'))).toBe(true)
+      expect(await readFile(join(worktreePath, 'setup.log'), 'utf8')).toBe(
+        'about to kill\npass2-cmd1\npass2-cmd2\n',
+      )
+
+      // Pass 3: now marked complete, skipping setup even with invalid config
+      await writeFile(join(worktreePath, '.drovr', 'worktrees.json'), 'INVALID JSON {][}', 'utf8')
+      const proc3 = spawnSync('node', [drovr, 'start', '--resume'], {
+        cwd: repo,
+        encoding: 'utf8',
+      })
+      expect(proc3.status).toBe(0)
     } finally {
       await rm(repo, { recursive: true, force: true })
     }
