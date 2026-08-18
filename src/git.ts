@@ -1,5 +1,6 @@
-import { execFileSync } from 'node:child_process'
-import { dirname, join, resolve } from 'node:path'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { realpathSync } from 'node:fs'
+import { isAbsolute, join, relative, resolve } from 'node:path'
 
 export function runGit(cwd: string, args: string[]): string {
   return execFileSync('git', args, {
@@ -28,29 +29,78 @@ export function resolveGitCommonDir(cwd: string): string {
 }
 
 export function isGitCheckoutDirty(cwd: string): boolean {
-  return runGit(cwd, ['status', '--porcelain']).length > 0
+  return runGit(cwd, ['status', '--porcelain', '--untracked-files=normal']).length > 0
 }
 
 export function isGitBranchPresent(cwd: string, branchName: string): boolean {
-  try {
-    runGit(cwd, ['rev-parse', '--verify', `refs/heads/${branchName}`])
+  const ref = `refs/heads/${branchName}`
+  const result = spawnSync('git', ['show-ref', '--verify', '--quiet', ref], {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+
+  if (result.error) {
+    throw result.error
+  }
+  if (result.status === 0) {
     return true
-  } catch {
+  }
+  if (result.status === 1) {
+    const revCheck = spawnSync('git', ['rev-parse', '--verify', ref], {
+      cwd,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    if (revCheck.stderr.includes('broken ref') || revCheck.stderr.includes('corrupt')) {
+      throw new Error(`Git reference "${ref}" is broken or corrupt: ${revCheck.stderr.trim()}`)
+    }
     return false
   }
+
+  throw new Error(`git show-ref failed with exit code ${result.status}: ${result.stderr.trim()}`)
 }
 
 export function isBeneathManagedWorktrees(cwd: string, root: string): boolean {
-  try {
-    const commonDir = resolveGitCommonDir(cwd)
-    const mainRepoRoot = dirname(commonDir)
-    const managedArea = join(mainRepoRoot, '.worktrees')
-    const check = (p: string): boolean => {
-      const resolved = resolve(p)
-      return resolved === managedArea || resolved.startsWith(managedArea + '/')
+  const output = runGit(cwd, ['worktree', 'list', '--porcelain'])
+  const registeredRoots: string[] = []
+  for (const line of output.split('\n')) {
+    if (line.startsWith('worktree ')) {
+      registeredRoots.push(line.slice('worktree '.length).trim())
     }
-    return check(cwd) || check(root)
-  } catch {
-    return false
   }
+
+  const candidatePaths = [safeRealpath(cwd), safeRealpath(root), resolve(cwd), resolve(root)]
+
+  for (const regRoot of registeredRoots) {
+    const realRegRoot = safeRealpath(regRoot)
+    const managedAreas = [join(realRegRoot, '.worktrees'), join(regRoot, '.worktrees')]
+
+    for (const managed of managedAreas) {
+      const realManaged = safeRealpath(managed)
+      for (const cand of candidatePaths) {
+        if (isPathBeneath(cand, realManaged) || isPathBeneath(cand, managed)) {
+          return true
+        }
+      }
+    }
+  }
+
+  return false
+}
+
+function safeRealpath(p: string): string {
+  try {
+    return realpathSync(p)
+  } catch (err) {
+    if (typeof err === 'object' && err !== null && 'code' in err && err.code === 'ENOENT') {
+      return resolve(p)
+    }
+    throw err
+  }
+}
+
+function isPathBeneath(target: string, parent: string): boolean {
+  const rel = relative(parent, target)
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
 }

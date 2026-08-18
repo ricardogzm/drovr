@@ -1,4 +1,4 @@
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
 import {
@@ -21,6 +21,7 @@ export interface DrovrContext {
   counts?: DrovrLoggerCounts
   root?: string
   cwd?: string
+  mode?: 'fresh' | 'resume'
 }
 
 const NAME_REGEX = /^[a-z][a-z0-9_-]{0,31}$/
@@ -30,7 +31,7 @@ export function isValidName(name: unknown): name is Name {
 }
 
 export function createDrovr(context: DrovrContext = {}): Drovr {
-  const { db, logger, counts, root, cwd } = context
+  const { db, logger, counts, root, cwd, mode = 'fresh' } = context
   const workingDir = root ?? cwd ?? process.cwd()
   return {
     async resource() {
@@ -201,12 +202,16 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
         )
       }
 
+      if (mode === 'resume') {
+        throw new Error('worktree resume is not implemented yet')
+      }
+
       const name = opts.name
       const branchName = `drovr/${name}`
       const worktreePath = join(workingDir, '.worktrees', name)
 
       const branchExists = isGitBranchPresent(workingDir, branchName)
-      const directoryExists = await pathExists(worktreePath)
+      const directoryExists = await entryExists(worktreePath)
 
       if (branchExists || directoryExists) {
         if (branchExists && directoryExists) {
@@ -435,9 +440,9 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
   }
 }
 
-async function pathExists(path: string): Promise<boolean> {
+async function entryExists(path: string): Promise<boolean> {
   try {
-    await stat(path)
+    await lstat(path)
     return true
   } catch (error) {
     if (isEnoent(error)) {

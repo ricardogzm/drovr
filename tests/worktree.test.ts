@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { existsSync } from 'node:fs'
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { existsSync, lstatSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -340,6 +340,231 @@ export default async function workflow(drovr: Drovr): Promise<void> {
       const branches = runGit(repo, ['branch', '--list', 'drovr/*'])
       expect(branches).toBe('')
       expect(existsSync(join(repo, '.worktrees'))).toBe(false)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects worktree creation during resume mode before any exclude or git mutation', async () => {
+    const repo = await initRepo()
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      // First create starter main.ts that does not call worktree so fresh start initializes project db
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+
+export default async function workflow(drovr: Drovr): Promise<void> {}
+`,
+        'utf8',
+      )
+      execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })
+
+      // Now update main.ts to call worktree during resume
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+
+export default async function workflow(drovr: Drovr): Promise<void> {
+  await drovr.worktree({ name: 'resume-attempt' })
+}
+`,
+        'utf8',
+      )
+
+      expect(() =>
+        execFileSync('node', [drovr, 'start', '--resume'], { cwd: repo, stdio: 'pipe' }),
+      ).toThrow(/worktree resume/i)
+
+      // No branch, worktree directory, or exclude entry was created
+      expect(() =>
+        runGit(repo, ['rev-parse', '--verify', 'refs/heads/drovr/resume-attempt']),
+      ).toThrow(/Command failed/)
+      expect(existsSync(join(repo, '.worktrees', 'resume-attempt'))).toBe(false)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('detects managed worktrees beneath external linked Start checkouts and symlinks', async () => {
+    const repo = await initRepo()
+    const externalLinked = await mkdtemp(join(tmpdir(), 'drovr-ext-linked-'))
+    runGit(repo, ['worktree', 'add', '-b', 'feat-ext-linked', externalLinked, 'HEAD'])
+
+    try {
+      const nestedInExternal = join(externalLinked, '.worktrees', 'nested-worker')
+      runGit(externalLinked, [
+        'worktree',
+        'add',
+        '-b',
+        'drovr/nested-worker',
+        nestedInExternal,
+        'HEAD',
+      ])
+
+      // Starting Drovr from nestedInExternal must fail
+      expect(() =>
+        execFileSync('node', [drovr, 'start'], { cwd: nestedInExternal, stdio: 'pipe' }),
+      ).toThrow(/managed.*worktree|\.worktrees/i)
+
+      // Symlink to nested worktree must also fail
+      const symlinkPath = join(repo, 'symlink-to-nested')
+      await symlink(nestedInExternal, symlinkPath, 'dir')
+      expect(() =>
+        execFileSync('node', [drovr, 'start'], { cwd: symlinkPath, stdio: 'pipe' }),
+      ).toThrow(/managed.*worktree|\.worktrees/i)
+
+      // But starting from externalLinked itself must succeed
+      await mkdir(join(externalLinked, '.drovr'), { recursive: true })
+      await writeFile(
+        join(externalLinked, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+
+export default async function workflow(drovr: Drovr): Promise<void> {}
+`,
+        'utf8',
+      )
+      expect(() =>
+        execFileSync('node', [drovr, 'start'], { cwd: externalLinked, stdio: 'pipe' }),
+      ).not.toThrow()
+    } finally {
+      runGit(repo, ['worktree', 'remove', '--force', externalLinked])
+      await rm(externalLinked, { recursive: true, force: true })
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('fails with resume guidance when derived path is a file, directory, valid symlink, or dangling symlink before exclude or git mutation', async () => {
+    const repo = await initRepo()
+    const wtDir = join(repo, '.worktrees')
+    await mkdir(wtDir, { recursive: true })
+
+    // 1. Regular file
+    const filePath = join(wtDir, 'file-entry')
+    await writeFile(filePath, 'i am a file\n', 'utf8')
+
+    // 2. Directory
+    const dirPath = join(wtDir, 'dir-entry')
+    await mkdir(dirPath, { recursive: true })
+    await writeFile(join(dirPath, 'content.txt'), 'dir content\n', 'utf8')
+
+    // 3. Valid symlink
+    const targetFile = join(repo, 'README.md')
+    const validSymlinkPath = join(wtDir, 'valid-symlink-entry')
+    await symlink(targetFile, validSymlinkPath)
+
+    // 4. Dangling symlink
+    const danglingSymlinkPath = join(wtDir, 'dangling-symlink-entry')
+    await symlink(join(repo, 'non-existent-target'), danglingSymlinkPath)
+
+    const excludePath = join(repo, '.git', 'info', 'exclude')
+    await mkdir(join(repo, '.git', 'info'), { recursive: true })
+    await writeFile(excludePath, 'keep-me\n', 'utf8')
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+
+      const entriesToTest = [
+        'file-entry',
+        'dir-entry',
+        'valid-symlink-entry',
+        'dangling-symlink-entry',
+      ]
+
+      for (const name of entriesToTest) {
+        await writeFile(
+          join(repo, '.drovr/main.ts'),
+          `import type { Drovr } from "drovr"
+
+export default async function workflow(drovr: Drovr): Promise<void> {
+  await drovr.worktree({ name: ${JSON.stringify(name)} })
+}
+`,
+          'utf8',
+        )
+
+        expect(() => execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })).toThrow(
+          /--resume/,
+        )
+
+        // Branch must NOT be created
+        expect(() => runGit(repo, ['rev-parse', '--verify', `refs/heads/drovr/${name}`])).toThrow(
+          /Command failed/,
+        )
+      }
+
+      // File entries must remain untouched
+      expect(await readFile(filePath, 'utf8')).toBe('i am a file\n')
+      expect(await readFile(join(dirPath, 'content.txt'), 'utf8')).toBe('dir content\n')
+      expect(lstatSync(validSymlinkPath).isSymbolicLink()).toBe(true)
+      expect(lstatSync(danglingSymlinkPath).isSymbolicLink()).toBe(true)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('propagates fatal git errors and broken refs before exclude or git mutation', async () => {
+    const repo = await initRepo()
+    const brokenRefPath = join(repo, '.git', 'refs', 'heads', 'drovr', 'broken-ref')
+    await mkdir(join(repo, '.git', 'refs', 'heads', 'drovr'), { recursive: true })
+    await writeFile(brokenRefPath, 'invalid-broken-sha\n', 'utf8')
+
+    const excludePath = join(repo, '.git', 'info', 'exclude')
+    await mkdir(join(repo, '.git', 'info'), { recursive: true })
+    await writeFile(excludePath, 'custom-exclude\n', 'utf8')
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+
+export default async function workflow(drovr: Drovr): Promise<void> {
+  await drovr.worktree({ name: 'broken-ref' })
+}
+`,
+        'utf8',
+      )
+
+      expect(() => execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })).toThrow(
+        /broken or corrupt|not a valid ref|show-ref/i,
+      )
+
+      // Exclude must NOT be mutated with /.worktrees/
+      const excludeContent = await readFile(excludePath, 'utf8')
+      expect(excludeContent).toBe('custom-exclude\n')
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('warns on a Start checkout containing only untracked files even when status.showUntrackedFiles is no', async () => {
+    const repo = await initRepo()
+    runGit(repo, ['config', 'status.showUntrackedFiles', 'no'])
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+
+export default async function workflow(drovr: Drovr): Promise<void> {
+  await drovr.worktree({ name: 'untracked-probe' })
+}
+`,
+        'utf8',
+      )
+
+      // Only an untracked file
+      await writeFile(join(repo, 'untracked-only.txt'), 'untracked content\n', 'utf8')
+
+      const proc = spawnSync('node', [drovr, 'start'], {
+        cwd: repo,
+        encoding: 'utf8',
+      })
+      expect(proc.status).toBe(0)
+      expect(proc.stderr).toMatch(/warning.*uncommitted/i)
     } finally {
       await rm(repo, { recursive: true, force: true })
     }
