@@ -8,11 +8,11 @@ export function runGit(cwd: string, args: string[]): string {
   }).trimEnd()
 }
 
-export function resolveGitWorktreeRoot(cwd: string): string {
+export function resolveGitWorktreeRoot(cwd: string, command: string = 'drovr setup'): string {
   try {
     return runGit(cwd, ['rev-parse', '--show-toplevel'])
   } catch {
-    throw new Error('drovr setup must run inside a git worktree')
+    throw new Error(`${command} must run inside a git worktree`)
   }
 }
 
