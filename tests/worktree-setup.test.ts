@@ -1,6 +1,7 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { DatabaseSync } from 'node:sqlite'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -857,6 +858,406 @@ export default async function workflow(drovr: Drovr): Promise<void> {
     } finally {
       await rm(repo, { recursive: true, force: true })
       await rm(syncDir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('Issue #29: Worktree setup replays conservatively after interruption', () => {
+  it('commits pending readiness before physical worktree creation and git mutation begins only after that commit', async () => {
+    const repo = await initRepo()
+
+    try {
+      await mkdir(join(repo, '.git', 'hooks'), { recursive: true })
+      const hookScript = `#!/usr/bin/env node
+const { DatabaseSync } = require('node:sqlite');
+const { writeFileSync } = require('node:fs');
+const { join } = require('node:path');
+try {
+  const db = new DatabaseSync(join(${JSON.stringify(repo)}, '.drovr', 'state.sqlite'));
+  const row = db.prepare("SELECT status FROM worktree_setups WHERE name = 'sentinel-item'").get();
+  db.close();
+  writeFileSync(join(${JSON.stringify(repo)}, 'hook-observed-status.json'), JSON.stringify(row));
+} catch (e) {
+  writeFileSync(join(${JSON.stringify(repo)}, 'hook-observed-status.json'), JSON.stringify({ error: e.message }));
+}
+`
+      const hookPath = join(repo, '.git', 'hooks', 'post-checkout')
+      await writeFile(hookPath, hookScript, 'utf8')
+      await chmod(hookPath, 0o755)
+
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+
+export default async function workflow(drovr: Drovr): Promise<void> {
+  const wt = await drovr.worktree({ name: 'sentinel-item' })
+}
+`,
+        'utf8',
+      )
+
+      const proc = spawnSync('node', [drovr, 'start'], {
+        cwd: repo,
+        encoding: 'utf8',
+      })
+
+      expect(proc.status).toBe(0)
+      const hookResult = JSON.parse(await readFile(join(repo, 'hook-observed-status.json'), 'utf8'))
+      expect(hookResult).toEqual({ status: 'pending' })
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('skips setup on matching reconnect with completed readiness without rereading configuration', async () => {
+    const repo = await initRepo()
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr', 'worktrees.json'),
+        JSON.stringify(['echo pass-1-ran > setup.log']),
+      )
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+import { existsSync } from "node:fs"
+import { readFile, writeFile } from "node:fs/promises"
+import { join } from "node:path"
+
+export default async function workflow(drovr: Drovr): Promise<void> {
+  const wt = await drovr.worktree({ name: 'reconnect-item' })
+  const passFile = join(${JSON.stringify(repo)}, 'pass.txt')
+  const pass = existsSync(passFile) ? (await readFile(passFile, 'utf8')).trim() : '1'
+  if (pass === '1') {
+    await writeFile(join(wt.path, 'marker.txt'), 'from-pass-1\\n', 'utf8')
+    throw new Error('deliberate-crash-after-worktree-pass-1')
+  }
+  await writeFile(join(${JSON.stringify(repo)}, 'pass-2-success.txt'), 'ok\\n', 'utf8')
+}
+`,
+        'utf8',
+      )
+      runGit(repo, ['add', '.drovr'])
+      runGit(repo, ['commit', '-m', 'add workflow'])
+
+      // Pass 1: creates worktree, completes setup, writes setup.log, then crashes
+      const proc1 = spawnSync('node', [drovr, 'start'], {
+        cwd: repo,
+        encoding: 'utf8',
+      })
+      expect(proc1.status).not.toBe(0)
+      expect(proc1.stderr).toContain('deliberate-crash-after-worktree-pass-1')
+
+      const worktreePath = join(repo, '.worktrees', 'reconnect-item')
+      expect(existsSync(worktreePath)).toBe(true)
+      const setupLog1 = await readFile(join(worktreePath, 'setup.log'), 'utf8')
+      expect(setupLog1.trim()).toBe('pass-1-ran')
+
+      // Corrupt configuration inside worktree: invalid JSON syntax + failing command
+      await writeFile(
+        join(worktreePath, '.drovr', 'worktrees.json'),
+        'INVALID JSON SYNTAX {][}',
+        'utf8',
+      )
+
+      // Set pass 2
+      await writeFile(join(repo, 'pass.txt'), '2', 'utf8')
+
+      // Pass 2: resume should succeed and skip reading .drovr/worktrees.json
+      const proc2 = spawnSync('node', [drovr, 'start', '--resume'], {
+        cwd: repo,
+        encoding: 'utf8',
+      })
+      expect(proc2.status).toBe(0)
+      expect(existsSync(join(repo, 'pass-2-success.txt'))).toBe(true)
+
+      // Verify setup.log was NOT overwritten or modified
+      const setupLog2 = await readFile(join(worktreePath, 'setup.log'), 'utf8')
+      expect(setupLog2.trim()).toBe('pass-1-ran')
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('rereads current configuration and reruns complete command array from command one on pending readiness', async () => {
+    const repo = await initRepo()
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr', 'worktrees.json'),
+        JSON.stringify([
+          'echo cmd-1-pass-1 >> execution.log',
+          'echo cmd-2-fail >> execution.log && exit 1',
+        ]),
+      )
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+import { writeFile } from "node:fs/promises"
+import { join } from "node:path"
+
+export default async function workflow(drovr: Drovr): Promise<void> {
+  const wt = await drovr.worktree({ name: 'pending-rerun-item' })
+  await writeFile(join(${JSON.stringify(repo)}, 'workflow-success.txt'), 'ok\\n', 'utf8')
+}
+`,
+        'utf8',
+      )
+      runGit(repo, ['add', '.drovr'])
+      runGit(repo, ['commit', '-m', 'add setup with failure'])
+
+      // Pass 1: fails during setup command 2
+      const proc1 = spawnSync('node', [drovr, 'start'], {
+        cwd: repo,
+        encoding: 'utf8',
+      })
+      expect(proc1.status).not.toBe(0)
+      expect(proc1.stderr).toContain('command 2 of 2')
+      expect(proc1.stderr).toContain('process exited with code 1')
+
+      const worktreePath = join(repo, '.worktrees', 'pending-rerun-item')
+      expect(existsSync(worktreePath)).toBe(true)
+      const logPass1 = await readFile(join(worktreePath, 'execution.log'), 'utf8')
+      expect(logPass1).toBe('cmd-1-pass-1\ncmd-2-fail\n')
+
+      // Update configuration in worktree to new command list
+      await writeFile(
+        join(worktreePath, '.drovr', 'worktrees.json'),
+        JSON.stringify([
+          'echo cmd-1-pass-2 >> execution.log',
+          'echo cmd-2-pass-2 >> execution.log',
+        ]),
+        'utf8',
+      )
+
+      // Pass 2: resume reruns current configuration from command one
+      const proc2 = spawnSync('node', [drovr, 'start', '--resume'], {
+        cwd: repo,
+        encoding: 'utf8',
+      })
+      expect(proc2.status).toBe(0)
+      expect(existsSync(join(repo, 'workflow-success.txt'))).toBe(true)
+
+      const logPass2 = await readFile(join(worktreePath, 'execution.log'), 'utf8')
+      expect(logPass2).toBe('cmd-1-pass-1\ncmd-2-fail\ncmd-1-pass-2\ncmd-2-pass-2\n')
+
+      // Pass 3: with readiness complete, corrupting worktrees.json does not affect resume
+      await writeFile(join(worktreePath, '.drovr', 'worktrees.json'), 'INVALID JSON {][}', 'utf8')
+      const proc3 = spawnSync('node', [drovr, 'start', '--resume'], {
+        cwd: repo,
+        encoding: 'utf8',
+      })
+      expect(proc3.status).toBe(0)
+      const logPass3 = await readFile(join(worktreePath, 'execution.log'), 'utf8')
+      expect(logPass3).toBe('cmd-1-pass-1\ncmd-2-fail\ncmd-1-pass-2\ncmd-2-pass-2\n')
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('rereads current configuration and runs setup when readiness is missing from database on reconnect', async () => {
+    const repo = await initRepo()
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+import { writeFile } from "node:fs/promises"
+import { join } from "node:path"
+
+export default async function workflow(drovr: Drovr): Promise<void> {
+  const wt = await drovr.worktree({ name: 'missing-status-item' })
+  await writeFile(join(${JSON.stringify(repo)}, 'workflow-success.txt'), 'ok\\n', 'utf8')
+}
+`,
+        'utf8',
+      )
+      runGit(repo, ['add', '.drovr'])
+      runGit(repo, ['commit', '-m', 'add workflow'])
+
+      // Pass 1: creates worktree without setup config
+      const proc1 = spawnSync('node', [drovr, 'start'], {
+        cwd: repo,
+        encoding: 'utf8',
+      })
+      expect(proc1.status).toBe(0)
+
+      const worktreePath = join(repo, '.worktrees', 'missing-status-item')
+      expect(existsSync(worktreePath)).toBe(true)
+
+      // Delete setup record from database to simulate missing readiness
+      const db = new DatabaseSync(join(repo, '.drovr', 'state.sqlite'))
+      db.prepare("DELETE FROM worktree_setups WHERE name = 'missing-status-item'").run()
+      db.close()
+
+      // Add setup config in worktree
+      await mkdir(join(worktreePath, '.drovr'), { recursive: true })
+      await writeFile(
+        join(worktreePath, '.drovr', 'worktrees.json'),
+        JSON.stringify(['echo replayed-for-missing > missing.log']),
+        'utf8',
+      )
+
+      // Pass 2: resume detects missing readiness and executes setup
+      const proc2 = spawnSync('node', [drovr, 'start', '--resume'], {
+        cwd: repo,
+        encoding: 'utf8',
+      })
+      expect(proc2.status).toBe(0)
+      expect(await readFile(join(worktreePath, 'missing.log'), 'utf8')).toBe(
+        'replayed-for-missing\n',
+      )
+
+      // Pass 3: now marked complete, skipping setup
+      await writeFile(join(worktreePath, '.drovr', 'worktrees.json'), 'INVALID JSON {][}', 'utf8')
+      const proc3 = spawnSync('node', [drovr, 'start', '--resume'], {
+        cwd: repo,
+        encoding: 'utf8',
+      })
+      expect(proc3.status).toBe(0)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('signal termination during setup leaves readiness pending so resume reruns setup', async () => {
+    const repo = await initRepo()
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr', 'worktrees.json'),
+        JSON.stringify(['echo started-pass-1 >> signal.log', 'kill -TERM $$']),
+      )
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+import { writeFile } from "node:fs/promises"
+import { join } from "node:path"
+
+export default async function workflow(drovr: Drovr): Promise<void> {
+  const wt = await drovr.worktree({ name: 'signal-item' })
+  await writeFile(join(${JSON.stringify(repo)}, 'workflow-success.txt'), 'ok\\n', 'utf8')
+}
+`,
+        'utf8',
+      )
+      runGit(repo, ['add', '.drovr'])
+      runGit(repo, ['commit', '-m', 'add setup with signal'])
+
+      // Pass 1: fails on signal
+      const proc1 = spawnSync('node', [drovr, 'start'], {
+        cwd: repo,
+        encoding: 'utf8',
+      })
+      expect(proc1.status).not.toBe(0)
+      expect(proc1.stderr).toContain('command 2 of 2')
+      expect(proc1.stderr).toContain('process terminated by signal SIGTERM')
+
+      const worktreePath = join(repo, '.worktrees', 'signal-item')
+      expect(existsSync(worktreePath)).toBe(true)
+      expect(await readFile(join(worktreePath, 'signal.log'), 'utf8')).toBe('started-pass-1\n')
+
+      // Fix configuration in worktree
+      await writeFile(
+        join(worktreePath, '.drovr', 'worktrees.json'),
+        JSON.stringify(['echo fixed-pass-2 >> signal.log']),
+        'utf8',
+      )
+
+      // Pass 2: resume reruns setup
+      const proc2 = spawnSync('node', [drovr, 'start', '--resume'], {
+        cwd: repo,
+        encoding: 'utf8',
+      })
+      expect(proc2.status).toBe(0)
+      expect(existsSync(join(repo, 'workflow-success.txt'))).toBe(true)
+      expect(await readFile(join(worktreePath, 'signal.log'), 'utf8')).toBe(
+        'started-pass-1\nfixed-pass-2\n',
+      )
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('resets readiness to pending before recreation during resume repair and reruns setup', async () => {
+    const repo = await initRepo()
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr', 'worktrees.json'),
+        JSON.stringify(['echo setup-for-repair >> repair.log']),
+      )
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+import { writeFile } from "node:fs/promises"
+import { join } from "node:path"
+
+export default async function workflow(drovr: Drovr): Promise<void> {
+  const wt = await drovr.worktree({ name: 'repair-item' })
+  await writeFile(join(${JSON.stringify(repo)}, 'repair-success.txt'), 'ok\\n', 'utf8')
+}
+`,
+        'utf8',
+      )
+      runGit(repo, ['add', '.drovr'])
+      runGit(repo, ['commit', '-m', 'add workflow for repair'])
+
+      // Pass 1: creates worktree and runs setup successfully
+      const proc1 = spawnSync('node', [drovr, 'start'], {
+        cwd: repo,
+        encoding: 'utf8',
+      })
+      expect(proc1.status).toBe(0)
+      const worktreePath = join(repo, '.worktrees', 'repair-item')
+      expect(existsSync(worktreePath)).toBe(true)
+      expect(await readFile(join(worktreePath, 'repair.log'), 'utf8')).toBe('setup-for-repair\n')
+
+      // Hook in repo to verify pending status reset during recreation
+      await mkdir(join(repo, '.git', 'hooks'), { recursive: true })
+      const hookScript = `#!/usr/bin/env node
+const { DatabaseSync } = require('node:sqlite');
+const { writeFileSync } = require('node:fs');
+const { join } = require('node:path');
+try {
+  const db = new DatabaseSync(join(${JSON.stringify(repo)}, '.drovr', 'state.sqlite'));
+  const row = db.prepare("SELECT status FROM worktree_setups WHERE name = 'repair-item'").get();
+  db.close();
+  writeFileSync(join(${JSON.stringify(repo)}, 'repair-hook-observed-status.json'), JSON.stringify(row));
+} catch (e) {
+  writeFileSync(join(${JSON.stringify(repo)}, 'repair-hook-observed-status.json'), JSON.stringify({ error: e.message }));
+}
+`
+      const hookPath = join(repo, '.git', 'hooks', 'post-checkout')
+      await writeFile(hookPath, hookScript, 'utf8')
+      await chmod(hookPath, 0o755)
+
+      // Delete the physical worktree directory (simulating loss)
+      await rm(worktreePath, { recursive: true, force: true })
+      expect(existsSync(worktreePath)).toBe(false)
+
+      // Pass 2: resume repairs worktree and reruns setup
+      const proc2 = spawnSync('node', [drovr, 'start', '--resume'], {
+        cwd: repo,
+        encoding: 'utf8',
+      })
+      expect(proc2.status).toBe(0)
+      expect(existsSync(worktreePath)).toBe(true)
+      expect(await readFile(join(worktreePath, 'repair.log'), 'utf8')).toBe('setup-for-repair\n')
+
+      // Verify the hook observed 'pending' status during the git worktree add
+      const hookResult = JSON.parse(
+        await readFile(join(repo, 'repair-hook-observed-status.json'), 'utf8'),
+      )
+      expect(hookResult).toEqual({ status: 'pending' })
+    } finally {
+      await rm(repo, { recursive: true, force: true })
     }
   })
 })

@@ -262,6 +262,22 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
 
           await ensureCloneLocalWorktreeExclusion(workingDir)
 
+          const status = getWorktreeSetupStatus(db, name)
+          if (status === 'complete') {
+            return Object.freeze({
+              name,
+              path: worktreePath,
+            })
+          }
+
+          recordWorktreeSetupStatus(db, name, 'pending')
+          await runWorktreeSetup({
+            worktreePath,
+            name,
+            startCheckout: resolveGitWorktreeRoot(workingDir),
+          })
+          recordWorktreeSetupStatus(db, name, 'complete')
+
           return Object.freeze({
             name,
             path: worktreePath,
@@ -300,12 +316,14 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
           }
 
           await ensureCloneLocalWorktreeExclusion(workingDir)
+          recordWorktreeSetupStatus(db, name, 'pending')
           runGit(workingDir, ['worktree', 'add', '--force', worktreePath, branchName])
           await runWorktreeSetup({
             worktreePath,
             name,
             startCheckout: resolveGitWorktreeRoot(workingDir),
           })
+          recordWorktreeSetupStatus(db, name, 'complete')
 
           return Object.freeze({
             name,
@@ -314,12 +332,14 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
         }
 
         await ensureCloneLocalWorktreeExclusion(workingDir)
+        recordWorktreeSetupStatus(db, name, 'pending')
         runGit(workingDir, ['worktree', 'add', worktreePath, branchName])
         await runWorktreeSetup({
           worktreePath,
           name,
           startCheckout: resolveGitWorktreeRoot(workingDir),
         })
+        recordWorktreeSetupStatus(db, name, 'complete')
 
         return Object.freeze({
           name,
@@ -351,12 +371,14 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
         process.stderr.write('Warning: Start checkout has uncommitted changes\n')
       }
 
+      recordWorktreeSetupStatus(db, name, 'pending')
       runGit(workingDir, ['worktree', 'add', '-b', branchName, worktreePath, 'HEAD'])
       await runWorktreeSetup({
         worktreePath,
         name,
         startCheckout: resolveGitWorktreeRoot(workingDir),
       })
+      recordWorktreeSetupStatus(db, name, 'complete')
 
       return Object.freeze({
         name,
@@ -597,4 +619,27 @@ async function ensureCloneLocalWorktreeExclusion(workingDir: string): Promise<vo
 
 function isEnoent(error: unknown): boolean {
   return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT'
+}
+
+function recordWorktreeSetupStatus(
+  db: DatabaseSync | undefined,
+  name: Name,
+  status: 'pending' | 'complete',
+): void {
+  if (!db) {
+    return
+  }
+  db.prepare(
+    'INSERT INTO worktree_setups (name, status) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET status = excluded.status',
+  ).run(name, status)
+}
+
+function getWorktreeSetupStatus(db: DatabaseSync | undefined, name: Name): string | undefined {
+  if (!db) {
+    return undefined
+  }
+  const row = db.prepare('SELECT status FROM worktree_setups WHERE name = ?').get(name) as
+    | { status: string }
+    | undefined
+  return row?.status
 }
