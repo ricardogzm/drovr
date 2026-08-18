@@ -437,10 +437,10 @@ export default async function workflow(drovr: Drovr): Promise<void> {}
 
   it('detects managed worktrees when registered roots contain newlines or trailing whitespace', async () => {
     const repo = await initRepo()
-    const specialRoot = join(tmpdir(), 'drovr-special-\nroot space ')
+    const parentDir = await mkdtemp(join(tmpdir(), 'drovr-special-parent-'))
+    const specialRoot = join(parentDir, 'special-\nroot space ')
     await mkdir(specialRoot, { recursive: true })
     runGit(repo, ['worktree', 'add', '-b', 'feat-special-ws', specialRoot, 'HEAD'])
-
     try {
       const nestedInSpecial = join(specialRoot, '.worktrees', 'worker-ws')
       runGit(specialRoot, ['worktree', 'add', '-b', 'drovr/worker-ws', nestedInSpecial, 'HEAD'])
@@ -465,7 +465,7 @@ export default async function workflow(drovr: Drovr): Promise<void> {}
       ).not.toThrow()
     } finally {
       runGit(repo, ['worktree', 'remove', '--force', specialRoot])
-      await rm(specialRoot, { recursive: true, force: true })
+      await rm(parentDir, { recursive: true, force: true })
       await rm(repo, { recursive: true, force: true })
     }
   })
