@@ -1,4 +1,4 @@
-import { execFileSync, spawn, spawnSync } from 'node:child_process'
+import { execFileSync, spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -53,7 +53,7 @@ async function lockDatabase(dbPath: string): Promise<{ release: () => Promise<vo
     `,
       dbPath,
     ],
-    { stdio: ['pipe', 'pipe', 'inherit'] },
+    { detached: true, stdio: ['pipe', 'pipe', 'inherit'] },
   )
 
   await new Promise<void>((resolve, reject) => {
@@ -73,10 +73,30 @@ async function lockDatabase(dbPath: string): Promise<{ release: () => Promise<vo
   return {
     async release() {
       if (locker.exitCode === null) {
-        locker.stdin.write('RELEASE\n')
-        await new Promise<void>((resolve) => locker.on('exit', () => resolve()))
+        try {
+          locker.stdin.write('RELEASE\n')
+        } catch {}
+        const exited = new Promise<void>((resolve) => locker.on('exit', () => resolve()))
+        const timeout = new Promise<void>((resolve) => setTimeout(resolve, 500))
+        await Promise.race([exited, timeout])
+        if (locker.exitCode === null && locker.pid) {
+          try {
+            process.kill(-locker.pid, 'SIGKILL')
+          } catch {}
+          await exited
+        }
       }
     },
+  }
+}
+
+async function terminateProcess(child: ChildProcess): Promise<void> {
+  if (child.exitCode === null && child.signalCode === null && child.pid) {
+    const exited = new Promise<void>((resolve) => child.on('exit', () => resolve()))
+    try {
+      process.kill(-child.pid, 'SIGKILL')
+    } catch {}
+    await exited
   }
 }
 
@@ -953,6 +973,11 @@ export default async function workflow(drovr: Drovr): Promise<void> {
         // Assert no git branch was created
         const branches = runGit(repo, ['branch', '--list', 'drovr/blocked-creation-item'])
         expect(branches.trim()).toBe('')
+
+        // Assert .git/info/exclude is untouched and does not contain worktree exclusion
+        const excludePath = join(repo, '.git', 'info', 'exclude')
+        const excludeContent = existsSync(excludePath) ? await readFile(excludePath, 'utf8') : ''
+        expect(excludeContent).not.toContain('/.worktrees/')
       } finally {
         await lock.release()
       }
@@ -967,6 +992,8 @@ export default async function workflow(drovr: Drovr): Promise<void> {
       expect(existsSync(worktreePath)).toBe(true)
       const branches = runGit(repo, ['branch', '--list', 'drovr/blocked-creation-item'])
       expect(branches.trim()).toContain('drovr/blocked-creation-item')
+      const excludeContentAfter = await readFile(join(repo, '.git', 'info', 'exclude'), 'utf8')
+      expect(excludeContentAfter).toContain('/.worktrees/')
     } finally {
       await rm(repo, { recursive: true, force: true })
     }
@@ -1215,21 +1242,24 @@ export default async function workflow(drovr: Drovr): Promise<void> {
       runGit(repo, ['add', '.drovr'])
       runGit(repo, ['commit', '-m', 'add setup with mid-step delay'])
 
-      // Spawn Drovr asynchronously
+      // Spawn Drovr asynchronously in its own process group
       const child = spawn('node', [drovr, 'start'], {
         cwd: repo,
+        detached: true,
         stdio: ['ignore', 'pipe', 'pipe'],
       })
 
-      // Wait until mid-setup marker file is touched
-      while (!existsSync(join(syncDir, 'mid_setup'))) {
-        await new Promise((r) => setTimeout(r, 20))
+      try {
+        // Wait until mid-setup marker file is touched
+        while (!existsSync(join(syncDir, 'mid_setup'))) {
+          await new Promise((r) => setTimeout(r, 20))
+        }
+
+        // Terminate the Drovr process group itself while setup is in flight
+        await terminateProcess(child)
+      } finally {
+        await terminateProcess(child)
       }
-
-      // Terminate the Drovr process itself while setup is in flight
-      child.kill('SIGTERM')
-      await new Promise<void>((resolve) => child.on('exit', () => resolve()))
-
       const worktreePath = join(repo, '.worktrees', 'interrupted-item')
       expect(existsSync(worktreePath)).toBe(true)
       expect(await readFile(join(worktreePath, 'setup.log'), 'utf8')).toBe('started-pass-1\n')
@@ -1263,7 +1293,7 @@ export default async function workflow(drovr: Drovr): Promise<void> {
       await rm(repo, { recursive: true, force: true })
       await rm(syncDir, { recursive: true, force: true })
     }
-  })
+  }, 20000)
 
   it('leaves readiness pending when database completion write fails so resume replays full array from command one', async () => {
     const repo = await initRepo()
@@ -1294,38 +1324,42 @@ export default async function workflow(drovr: Drovr): Promise<void> {
       runGit(repo, ['add', '.drovr'])
       runGit(repo, ['commit', '-m', 'add setup with sync barrier'])
 
-      // Spawn Drovr asynchronously
+      // Spawn Drovr asynchronously in its own process group
       const child = spawn('node', [drovr, 'start'], {
         cwd: repo,
+        detached: true,
         stdio: ['ignore', 'pipe', 'pipe'],
       })
 
-      // Wait until setup commands have completed
-      while (!existsSync(join(syncDir, 'commands_succeeded'))) {
-        await new Promise((r) => setTimeout(r, 20))
+      try {
+        // Wait until setup commands have completed
+        while (!existsSync(join(syncDir, 'commands_succeeded'))) {
+          await new Promise((r) => setTimeout(r, 20))
+        }
+
+        // Hold exclusive lock on project database so the completion write fails
+        const lock = await lockDatabase(join(repo, '.drovr', 'state.sqlite'))
+        try {
+          // Allow setup command 2 to exit so runWorktreeSetup returns to drovr.worktree()
+          await writeFile(join(syncDir, 'proceed'), '1', 'utf8')
+
+          // Wait for Drovr process to fail on the locked database completion write
+          let stderr = ''
+          child.stderr.on('data', (d: Buffer) => {
+            stderr += d.toString()
+          })
+          const exitCode = await new Promise<number | null>((resolve) => child.on('exit', resolve))
+          expect(exitCode).not.toBe(0)
+          expect(stderr).toContain('database is locked')
+        } finally {
+          await lock.release()
+        }
+      } finally {
+        await terminateProcess(child)
       }
-
-      // Hold exclusive lock on project database so the completion write fails
-      const lock = await lockDatabase(join(repo, '.drovr', 'state.sqlite'))
-
-      // Allow setup command 2 to exit so runWorktreeSetup returns to drovr.worktree()
-      await writeFile(join(syncDir, 'proceed'), '1', 'utf8')
-
-      // Wait for Drovr process to fail on the locked database completion write
-      let stderr = ''
-      child.stderr.on('data', (d: Buffer) => {
-        stderr += d.toString()
-      })
-      const exitCode = await new Promise<number | null>((resolve) => child.on('exit', resolve))
-      expect(exitCode).not.toBe(0)
-      expect(stderr).toContain('database is locked')
-
-      // Release the database lock
-      await lock.release()
 
       const worktreePath = join(repo, '.worktrees', 'db-fail-item')
       expect(existsSync(worktreePath)).toBe(true)
-
       // Update configuration in worktree
       await writeFile(
         join(worktreePath, '.drovr', 'worktrees.json'),

@@ -260,10 +260,9 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
             )
           }
 
-          await ensureCloneLocalWorktreeExclusion(workingDir)
-
           const status = getWorktreeSetupStatus(db, name)
           if (status === 'complete') {
+            await ensureCloneLocalWorktreeExclusion(workingDir)
             return Object.freeze({
               name,
               path: worktreePath,
@@ -271,13 +270,13 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
           }
 
           recordWorktreeSetupStatus(db, name, 'pending')
+          await ensureCloneLocalWorktreeExclusion(workingDir)
           await runWorktreeSetup({
             worktreePath,
             name,
             startCheckout: resolveGitWorktreeRoot(workingDir),
           })
           recordWorktreeSetupStatus(db, name, 'complete')
-
           return Object.freeze({
             name,
             path: worktreePath,
@@ -315,8 +314,8 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
             )
           }
 
-          await ensureCloneLocalWorktreeExclusion(workingDir)
           recordWorktreeSetupStatus(db, name, 'pending')
+          await ensureCloneLocalWorktreeExclusion(workingDir)
           runGit(workingDir, ['worktree', 'add', '--force', worktreePath, branchName])
           await runWorktreeSetup({
             worktreePath,
@@ -331,8 +330,8 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
           })
         }
 
-        await ensureCloneLocalWorktreeExclusion(workingDir)
         recordWorktreeSetupStatus(db, name, 'pending')
+        await ensureCloneLocalWorktreeExclusion(workingDir)
         runGit(workingDir, ['worktree', 'add', worktreePath, branchName])
         await runWorktreeSetup({
           worktreePath,
@@ -365,13 +364,12 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
         )
       }
 
-      await ensureCloneLocalWorktreeExclusion(workingDir)
-
       if (isGitCheckoutDirty(workingDir)) {
         process.stderr.write('Warning: Start checkout has uncommitted changes\n')
       }
 
       recordWorktreeSetupStatus(db, name, 'pending')
+      await ensureCloneLocalWorktreeExclusion(workingDir)
       runGit(workingDir, ['worktree', 'add', '-b', branchName, worktreePath, 'HEAD'])
       await runWorktreeSetup({
         worktreePath,
