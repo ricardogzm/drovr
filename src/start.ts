@@ -57,7 +57,7 @@ export async function runStart(cwd: string, options: StartOptions = {}): Promise
           throw new Error('Workflow at .drovr/main.ts must default export a function')
         }
 
-        const drovr = createDrovr()
+        const drovr = createDrovr({ db, logger, counts })
         await mod.default(drovr)
       } finally {
         db.close()

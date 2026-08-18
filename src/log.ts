@@ -17,6 +17,10 @@ export interface DrovrLogger {
   startBegin(mode: 'fresh' | 'resume'): void
   startComplete(mode: 'fresh' | 'resume', counts?: DrovrLoggerCounts): void
   startFail(mode: 'fresh' | 'resume', counts?: DrovrLoggerCounts, error?: unknown): void
+  mapItemStart(name: string): void
+  mapItemSkip(name: string): void
+  mapItemComplete(name: string): void
+  mapItemFail(name: string, error?: unknown): void
   close(): Promise<void>
 }
 
@@ -163,6 +167,19 @@ export function createDrovrLogger(options: DrovrLoggerOptions): DrovrLogger {
       logger.error(
         `start.fail mode=${mode} started=${counts.started} skipped=${counts.skipped} completed=${counts.completed} failed=${counts.failed} error=${JSON.stringify(errMessage)}`,
       )
+    },
+    mapItemStart(name: string) {
+      logger.info(`map.item.start name=${name}`)
+    },
+    mapItemSkip(name: string) {
+      logger.info(`map.item.skip name=${name}`)
+    },
+    mapItemComplete(name: string) {
+      logger.info(`map.item.complete name=${name}`)
+    },
+    mapItemFail(name: string, error?: unknown) {
+      const errMessage = formatErrorMessage(error)
+      logger.error(`map.item.fail name=${name} error=${JSON.stringify(errMessage)}`)
     },
     async close(): Promise<void> {
       await new Promise<void>((resolve) => {
