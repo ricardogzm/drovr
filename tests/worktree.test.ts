@@ -435,6 +435,41 @@ export default async function workflow(drovr: Drovr): Promise<void> {}
     }
   })
 
+  it('detects managed worktrees when registered roots contain newlines or trailing whitespace', async () => {
+    const repo = await initRepo()
+    const specialRoot = join(tmpdir(), 'drovr-special-\nroot space ')
+    await mkdir(specialRoot, { recursive: true })
+    runGit(repo, ['worktree', 'add', '-b', 'feat-special-ws', specialRoot, 'HEAD'])
+
+    try {
+      const nestedInSpecial = join(specialRoot, '.worktrees', 'worker-ws')
+      runGit(specialRoot, ['worktree', 'add', '-b', 'drovr/worker-ws', nestedInSpecial, 'HEAD'])
+
+      // Starting Drovr from nested child of the special root must fail
+      expect(() =>
+        execFileSync('node', [drovr, 'start'], { cwd: nestedInSpecial, stdio: 'pipe' }),
+      ).toThrow(/managed.*worktree|\.worktrees/i)
+
+      // Starting from specialRoot itself succeeds
+      await mkdir(join(specialRoot, '.drovr'), { recursive: true })
+      await writeFile(
+        join(specialRoot, '.drovr/main.ts'),
+        `import type { Drovr } from "drovr"
+
+export default async function workflow(drovr: Drovr): Promise<void> {}
+`,
+        'utf8',
+      )
+      expect(() =>
+        execFileSync('node', [drovr, 'start'], { cwd: specialRoot, stdio: 'pipe' }),
+      ).not.toThrow()
+    } finally {
+      runGit(repo, ['worktree', 'remove', '--force', specialRoot])
+      await rm(specialRoot, { recursive: true, force: true })
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
   it('fails with resume guidance when derived path is a file, directory, valid symlink, or dangling symlink before exclude or git mutation', async () => {
     const repo = await initRepo()
     const wtDir = join(repo, '.worktrees')

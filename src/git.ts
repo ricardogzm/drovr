@@ -7,7 +7,7 @@ export function runGit(cwd: string, args: string[]): string {
     cwd,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
-  }).trimEnd()
+  }).replace(/\r?\n$/, '')
 }
 
 export function resolveGitWorktreeRoot(cwd: string, command: string = 'drovr setup'): string {
@@ -62,11 +62,15 @@ export function isGitBranchPresent(cwd: string, branchName: string): boolean {
 }
 
 export function isBeneathManagedWorktrees(cwd: string, root: string): boolean {
-  const output = runGit(cwd, ['worktree', 'list', '--porcelain'])
+  const output = execFileSync('git', ['worktree', 'list', '--porcelain', '-z'], {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
   const registeredRoots: string[] = []
-  for (const line of output.split('\n')) {
-    if (line.startsWith('worktree ')) {
-      registeredRoots.push(line.slice('worktree '.length).trim())
+  for (const entry of output.split('\0')) {
+    if (entry.startsWith('worktree ')) {
+      registeredRoots.push(entry.slice('worktree '.length))
     }
   }
 
