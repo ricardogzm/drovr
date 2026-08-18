@@ -9,7 +9,20 @@ export interface HerdrWorkspaceResult {
   rootPaneId: string
 }
 
+function extractChildStderr(error: unknown): string {
+  if (typeof error === 'object' && error !== null && 'stderr' in error) {
+    if (typeof error.stderr === 'string') {
+      return error.stderr.trim()
+    }
+    if (error.stderr instanceof Buffer) {
+      return error.stderr.toString('utf8').trim()
+    }
+  }
+  return ''
+}
+
 export function runHerdr(cwd: string, args: string[]): string {
+  const commandName = `herdr ${args.slice(0, 2).join(' ')}`
   try {
     return execFileSync('herdr', args, {
       cwd,
@@ -18,17 +31,9 @@ export function runHerdr(cwd: string, args: string[]): string {
       stdio: ['pipe', 'pipe', 'pipe'],
     }).trimEnd()
   } catch (error: unknown) {
-    const commandName = `herdr ${args.slice(0, 2).join(' ')}`
-    if (typeof error === 'object' && error !== null && 'stderr' in error) {
-      const stderr =
-        typeof error.stderr === 'string'
-          ? error.stderr.trim()
-          : error.stderr instanceof Buffer
-            ? error.stderr.toString('utf8').trim()
-            : ''
-      if (stderr) {
-        throw new Error(`${commandName} failed: ${stderr}`)
-      }
+    const stderr = extractChildStderr(error)
+    if (stderr) {
+      throw new Error(`${commandName} failed: ${stderr}`)
     }
     throw new Error(`${commandName} failed`)
   }
@@ -104,44 +109,38 @@ export function startHerdrOmpWorker(
   runHerdr(commandCwd, ['agent', 'start', options.name, '--kind', 'omp', '--pane', options.paneId])
 }
 
-export async function runHerdrAsync(cwd: string, args: string[]): Promise<string> {
-  const commandName = `herdr ${args.slice(0, 2).join(' ')}`
-  try {
-    const { stdout } = await execFileAsync('herdr', args, {
-      cwd,
-      encoding: 'utf8',
-      env: process.env,
-    })
-    return stdout.trimEnd()
-  } catch (error: unknown) {
-    if (typeof error === 'object' && error !== null && 'stderr' in error) {
-      const stderr =
-        typeof error.stderr === 'string'
-          ? error.stderr.trim()
-          : error.stderr instanceof Buffer
-            ? error.stderr.toString('utf8').trim()
-            : ''
-      if (stderr) {
-        throw new Error(`${commandName} failed: ${stderr}`)
-      }
-    }
-    throw new Error(`${commandName} failed`)
-  }
-}
-
 export async function promptHerdrOmpWorker(
   commandCwd: string,
   options: { name: Name; text: string },
 ): Promise<void> {
-  await runHerdrAsync(commandCwd, [
-    'agent',
-    'prompt',
-    options.name,
-    options.text,
-    '--wait',
-    '--until',
-    'idle',
-    '--until',
-    'done',
-  ])
+  try {
+    await execFileAsync(
+      'herdr',
+      [
+        'agent',
+        'prompt',
+        options.name,
+        options.text,
+        '--wait',
+        '--until',
+        'idle',
+        '--until',
+        'done',
+      ],
+      {
+        cwd: commandCwd,
+        encoding: 'utf8',
+        env: process.env,
+      },
+    )
+  } catch (error: unknown) {
+    const stderr = extractChildStderr(error)
+    if (stderr) {
+      process.stderr.write(`${stderr}\n`)
+    }
+    if (stderr.includes('agent_prompt_stalled') || stderr.includes('stalled')) {
+      throw new Error('herdr agent prompt failed: agent_prompt_stalled')
+    }
+    throw new Error('herdr agent prompt failed')
+  }
 }
