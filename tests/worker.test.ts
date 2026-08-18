@@ -80,6 +80,8 @@ interface MockHerdrState {
   panes?: MockHerdrPane[]
   agents?: MockHerdrAgent[]
   failNextWorkspaceCreate?: boolean | string
+  failWorkspaceCreateForName?: Record<string, string>
+  malformedNextWorkspaceCreate?: boolean | string
   failNextAgentStart?: boolean | string
   failAgentStartForName?: Record<string, string>
   failNextAgentPrompt?: boolean | string
@@ -141,14 +143,6 @@ if (args[0] === 'pane') {
 
 // Subcommand: herdr workspace create [OPTIONS]
 if (args[0] === 'workspace' && args[1] === 'create') {
-  if (state.failNextWorkspaceCreate) {
-    const msg = typeof state.failNextWorkspaceCreate === 'string' ? state.failNextWorkspaceCreate : 'Simulated workspace create error'
-    state.failNextWorkspaceCreate = false
-    saveState()
-    console.error(msg)
-    process.exit(1)
-  }
-
   let cwd = process.cwd()
   let label = undefined
   let focused = true
@@ -164,6 +158,31 @@ if (args[0] === 'workspace' && args[1] === 'create') {
       focused = true
     }
   }
+
+  if (label && state.failWorkspaceCreateForName && state.failWorkspaceCreateForName[label]) {
+    const msg = state.failWorkspaceCreateForName[label]
+    delete state.failWorkspaceCreateForName[label]
+    saveState()
+    console.error(msg)
+    process.exit(1)
+  }
+
+  if (state.failNextWorkspaceCreate) {
+    const msg = typeof state.failNextWorkspaceCreate === 'string' ? state.failNextWorkspaceCreate : 'Simulated workspace create error'
+    state.failNextWorkspaceCreate = false
+    saveState()
+    console.error(msg)
+    process.exit(1)
+  }
+
+  if (state.malformedNextWorkspaceCreate) {
+    const rawOut = typeof state.malformedNextWorkspaceCreate === 'string' ? state.malformedNextWorkspaceCreate : 'RAW_MALFORMED_OUTPUT'
+    state.malformedNextWorkspaceCreate = false
+    saveState()
+    console.log(rawOut)
+    process.exit(0)
+  }
+
 
   const num = state.nextWorkspaceNum++
   const wsId = 'w' + num
@@ -785,8 +804,8 @@ export default async function (drovr: Drovr) {
 
   const firstRejected = rejected[0]
   const loserError = firstRejected && 'reason' in firstRejected ? firstRejected.reason : undefined
-  if (!loserError || !String(loserError.message || loserError).includes('already exists')) {
-    throw new Error('Expected explicit loser error about agent already existing, got: ' + loserError)
+  if (!loserError || (!String(loserError.message || loserError).includes('already exists') && !String(loserError.message || loserError).includes('herdr agent start failed'))) {
+    throw new Error('Expected explicit loser error about agent start failure, got: ' + loserError)
   }
 }
 `,
@@ -1281,15 +1300,29 @@ export default async function (drovr: Drovr) {
     await rm(dir, { recursive: true, force: true })
   })
 
-  it('excludes prompt bodies and Herdr subprocess output from Drovr log events even on errors', async () => {
+  it('excludes prompt bodies and Herdr subprocess output from Drovr log events across prompt errors, workspace creation errors, and agent start errors', async () => {
     const dir = await initRepo()
     const secretPromptSuccess = 'SECRET_PAYLOAD_SUCCESS_XYZ_777'
     const secretPromptFail = 'SECRET_PAYLOAD_FAIL_ABC_888'
-    const distinctiveStderr =
+    const secretStartFail = 'SECRET_START_FAIL_DEF_999'
+    const secretWsFail = 'SECRET_WS_FAIL_GHI_000'
+
+    const distinctivePromptStderr =
       'agent_prompt_stalled: herdr-stderr-raw-diagnostic for prompt ' + secretPromptFail
+    const distinctiveStartStderr =
+      'herdr-stderr-start-failure: process crashed with prompt context ' + secretStartFail
+    const distinctiveWsStderr =
+      'herdr-stderr-ws-failure: workspace creation rejected prompt payload ' + secretWsFail
+
     const { binDir, statePath } = await setupMockHerdr(dir, {
       stallAgentPromptForName: {
-        'worker-log-fail': distinctiveStderr,
+        'item-prompt-fail': distinctivePromptStderr,
+      },
+      failAgentStartForName: {
+        'item-start-fail': distinctiveStartStderr,
+      },
+      failWorkspaceCreateForName: {
+        'item-ws-fail': distinctiveWsStderr,
       },
     })
 
@@ -1299,11 +1332,13 @@ export default async function (drovr: Drovr) {
       `import type { Drovr } from 'drovr'
 export default async function (drovr: Drovr) {
   const items = [
-    { name: 'worker-log-ok', prompt: ${JSON.stringify(secretPromptSuccess)} },
-    { name: 'worker-log-fail', prompt: ${JSON.stringify(secretPromptFail)} },
+    { name: 'item-ok', prompt: ${JSON.stringify(secretPromptSuccess)} },
+    { name: 'item-prompt-fail', prompt: ${JSON.stringify(secretPromptFail)} },
+    { name: 'item-start-fail', prompt: ${JSON.stringify(secretStartFail)} },
+    { name: 'item-ws-fail', prompt: ${JSON.stringify(secretWsFail)} },
   ]
 
-  await drovr.map(items, { concurrency: 2, name: (i) => i.name }, async (item) => {
+  await drovr.map(items, { concurrency: 4, name: (i) => i.name }, async (item) => {
     const wt = await drovr.worktree({ name: item.name })
     const worker = await drovr.start({ name: item.name, cwd: wt.path })
     await worker.prompt(item.prompt)
@@ -1330,17 +1365,83 @@ export default async function (drovr: Drovr) {
 
     const errInfo = extractExecError(caughtError)
     expect(errInfo.status).toBe(1)
-    expect(errInfo.stderr).toContain(distinctiveStderr)
+    expect(errInfo.stderr).toContain(distinctivePromptStderr)
+    expect(errInfo.stderr).toContain(distinctiveStartStderr)
+    expect(errInfo.stderr).toContain(distinctiveWsStderr)
 
     const logContent = await readFile(join(dir, '.drovr/drovr.log'), 'utf8')
     expect(logContent).not.toContain(secretPromptSuccess)
     expect(logContent).not.toContain(secretPromptFail)
-    expect(logContent).not.toContain(distinctiveStderr)
+    expect(logContent).not.toContain(secretStartFail)
+    expect(logContent).not.toContain(secretWsFail)
+    expect(logContent).not.toContain(distinctivePromptStderr)
+    expect(logContent).not.toContain(distinctiveStartStderr)
+    expect(logContent).not.toContain(distinctiveWsStderr)
     expect(logContent).not.toContain('herdr-stderr-raw-diagnostic')
+    expect(logContent).not.toContain('herdr-stderr-start-failure')
+    expect(logContent).not.toContain('herdr-stderr-ws-failure')
     expect(logContent).not.toContain('req-agent-prompt')
     expect(logContent).not.toContain('agent_prompted')
     expect(logContent).toContain(
-      'map.item.fail name=worker-log-fail error="herdr agent prompt failed: agent_prompt_stalled"',
+      'map.item.fail name=item-prompt-fail error="herdr agent prompt failed: agent_prompt_stalled"',
+    )
+    expect(logContent).toContain(
+      'map.item.fail name=item-start-fail error="herdr agent start failed"',
+    )
+    expect(logContent).toContain(
+      'map.item.fail name=item-ws-fail error="herdr workspace create failed"',
+    )
+
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('excludes malformed workspace stdout from Drovr log events on parse failure', async () => {
+    const dir = await initRepo()
+    const secretMalformed = 'SECRET_MALFORMED_STDOUT_JKL_111'
+    const distinctiveMalformedStdout =
+      'herdr-stdout-malformed-raw-data-including-prompt: ' + secretMalformed
+
+    const { binDir, statePath } = await setupMockHerdr(dir, {
+      malformedNextWorkspaceCreate: distinctiveMalformedStdout,
+    })
+
+    await mkdir(join(dir, '.drovr'), { recursive: true })
+    await writeFile(
+      join(dir, '.drovr/main.ts'),
+      `import type { Drovr } from 'drovr'
+export default async function (drovr: Drovr) {
+  const wt = await drovr.worktree({ name: 'worker-malformed' })
+  await drovr.start({ name: 'worker-malformed', cwd: wt.path })
+}
+`,
+      'utf8',
+    )
+
+    let caughtError: unknown
+    try {
+      execFileSync(process.execPath, [drovr, 'start'], {
+        cwd: dir,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          HERDR_STATE_FILE: statePath,
+        },
+      })
+    } catch (err: unknown) {
+      caughtError = err
+    }
+
+    const errInfo = extractExecError(caughtError)
+    expect(errInfo.status).toBe(1)
+    expect(errInfo.stderr).toContain(distinctiveMalformedStdout)
+
+    const logContent = await readFile(join(dir, '.drovr/drovr.log'), 'utf8')
+    expect(logContent).not.toContain(secretMalformed)
+    expect(logContent).not.toContain(distinctiveMalformedStdout)
+    expect(logContent).not.toContain('herdr-stdout-malformed-raw-data')
+    expect(logContent).toContain(
+      'start.fail mode=fresh started=0 skipped=0 completed=0 failed=0 error="failed to parse workspace create output"',
     )
 
     await rm(dir, { recursive: true, force: true })

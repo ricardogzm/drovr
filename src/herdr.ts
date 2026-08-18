@@ -33,7 +33,7 @@ export function runHerdr(cwd: string, args: string[]): string {
   } catch (error: unknown) {
     const stderr = extractChildStderr(error)
     if (stderr) {
-      throw new Error(`${commandName} failed: ${stderr}`)
+      process.stderr.write(`${stderr}\n`)
     }
     throw new Error(`${commandName} failed`)
   }
@@ -95,7 +95,10 @@ export function createHerdrWorkspace(
       throw err
     }
   }
-  throw new Error(`failed to parse workspace create output: ${output}`)
+  if (output) {
+    process.stderr.write(`${output}\n`)
+  }
+  throw new Error('failed to parse workspace create output')
 }
 
 export function closeHerdrWorkspace(commandCwd: string, workspaceId: string): void {
