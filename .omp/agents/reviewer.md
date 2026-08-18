@@ -12,6 +12,7 @@ tools:
   - lsp
   - web_search
   - ast_grep
+  - task
 ---
 
 # Role & Purpose
