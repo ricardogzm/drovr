@@ -26,6 +26,38 @@ const DEFAULT_COUNTS: DrovrLoggerCounts = {
   completed: 0,
   failed: 0,
 }
+function formatErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message
+  }
+  if (typeof error === 'string') {
+    return error
+  }
+  if (typeof error === 'bigint') {
+    return `${error.toString()}n`
+  }
+  if (error === undefined) {
+    return 'unknown error'
+  }
+  if (error === null) {
+    return 'null'
+  }
+  try {
+    const serialized = JSON.stringify(error)
+    if (serialized !== undefined) {
+      return serialized
+    }
+  } catch {
+    // Non-serializable object (e.g. circular structure)
+  }
+  if (typeof error === 'object') {
+    return Object.prototype.toString.call(error)
+  }
+  if (typeof error === 'function' || typeof error === 'symbol') {
+    return error.toString()
+  }
+  return 'unknown error'
+}
 
 export function createDrovrLogger(options: DrovrLoggerOptions): DrovrLogger {
   const { logPath, verbose = false } = options
@@ -112,14 +144,7 @@ export function createDrovrLogger(options: DrovrLoggerOptions): DrovrLogger {
       counts: DrovrLoggerCounts = DEFAULT_COUNTS,
       error?: unknown,
     ) {
-      const errMessage =
-        error instanceof Error
-          ? error.message
-          : typeof error === 'string'
-            ? error
-            : error !== undefined && error !== null
-              ? JSON.stringify(error)
-              : 'unknown error'
+      const errMessage = formatErrorMessage(error)
       logger.error(
         `start.fail mode=${mode} started=${counts.started} skipped=${counts.skipped} completed=${counts.completed} failed=${counts.failed} error=${JSON.stringify(errMessage)}`,
       )

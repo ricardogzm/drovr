@@ -33,7 +33,7 @@ export async function runStart(cwd: string, options: StartOptions = {}): Promise
     logger.startBegin(mode)
 
     const counts: DrovrLoggerCounts = { started: 0, skipped: 0, completed: 0, failed: 0 }
-    let runError: unknown = null
+    let failed = false
 
     try {
       const dbPath = join(drovrDir, 'state.sqlite')
@@ -63,11 +63,11 @@ export async function runStart(cwd: string, options: StartOptions = {}): Promise
         db.close()
       }
     } catch (err) {
-      runError = err
+      failed = true
       logger.startFail(mode, counts, err)
       throw err
     } finally {
-      if (!runError) {
+      if (!failed) {
         logger.startComplete(mode, counts)
       }
       await logger.close()

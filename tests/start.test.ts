@@ -613,4 +613,77 @@ export default async function workflow(): Promise<void> {
       await rm(repo, { recursive: true, force: true })
     }
   })
+
+  it('emits only start.fail when Workflow throws a falsy value (null, 0, false, "")', async () => {
+    const repo = await initRepo()
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        'export default async function workflow() { throw null }\n',
+        'utf8',
+      )
+
+      expect(() => execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })).toThrow(
+        /null/,
+      )
+
+      const logContent = await readFile(join(repo, '.drovr/drovr.log'), 'utf8')
+      const lines = logContent.trim().split('\n')
+      expect(lines).toHaveLength(2)
+
+      expect(lines[0]).toMatch(/INFO\s+start\.begin\s+mode=fresh/)
+      expect(lines[1]).toMatch(
+        /ERROR\s+start\.fail\s+mode=fresh\s+started=0\s+skipped=0\s+completed=0\s+failed=0/,
+      )
+      expect(logContent).not.toContain('start.complete')
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('safely logs start.fail without throwing when Workflow throws non-JSON-serializable value (bigint, circular)', async () => {
+    const repo = await initRepo()
+
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `export default async function workflow(): Promise<void> {
+  const circular: Record<string, unknown> = {}
+  circular.self = circular
+  throw circular
+}
+`,
+        'utf8',
+      )
+
+      let stderrOutput = ''
+      try {
+        execFileSync('node', [drovr, 'start'], {
+          cwd: repo,
+          stdio: 'pipe',
+          encoding: 'utf8',
+        })
+      } catch (err: unknown) {
+        const e = err as { stderr?: string; message?: string }
+        stderrOutput = e.stderr || e.message || ''
+      }
+
+      // Must not be replaced by a logger TypeError
+      expect(stderrOutput).not.toContain('Converting circular structure to JSON')
+
+      const logContent = await readFile(join(repo, '.drovr/drovr.log'), 'utf8')
+      const lines = logContent.trim().split('\n')
+      expect(lines).toHaveLength(2)
+
+      expect(lines[0]).toMatch(/INFO\s+start\.begin\s+mode=fresh/)
+      expect(lines[1]).toMatch(
+        /ERROR\s+start\.fail\s+mode=fresh\s+started=0\s+skipped=0\s+completed=0\s+failed=0/,
+      )
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
 })
