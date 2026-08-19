@@ -37,43 +37,6 @@ CREATE TABLE IF NOT EXISTS worktree_setups (
 
 PRAGMA user_version = 1;
 `
-function removeLegacyPortUniqueness(db: DatabaseSync): void {
-  const indexes = db.prepare('PRAGMA index_list(resource_ports)').all() as Array<{
-    name: string
-    unique: number
-  }>
-  const hasPortOnlyUniqueIndex = indexes.some((index) => {
-    if (index.unique !== 1) return false
-    const columns = db
-      .prepare(`PRAGMA index_info("${index.name.replaceAll('"', '""')}")`)
-      .all() as Array<{
-      name: string
-    }>
-    return columns.length === 1 && columns[0]?.name === 'port'
-  })
-  if (!hasPortOnlyUniqueIndex) return
-
-  db.exec('BEGIN IMMEDIATE;')
-  try {
-    db.exec(`
-      ALTER TABLE resource_ports RENAME TO resource_ports_legacy;
-      CREATE TABLE resource_ports (
-        resource_name TEXT NOT NULL REFERENCES resources(name) ON DELETE CASCADE,
-        port INTEGER NOT NULL CHECK(port >= 1 AND port <= 65535),
-        PRIMARY KEY (resource_name, port)
-      );
-      INSERT INTO resource_ports (resource_name, port)
-        SELECT resource_name, port FROM resource_ports_legacy;
-      DROP TABLE resource_ports_legacy;
-    `)
-    db.exec('COMMIT;')
-  } catch (error) {
-    try {
-      db.exec('ROLLBACK;')
-    } catch {}
-    throw error
-  }
-}
 
 export interface OpenProjectDatabaseOptions {
   mode?: 'fresh' | 'resume'
@@ -105,6 +68,5 @@ export function openProjectDatabase(
     }
   }
 
-  removeLegacyPortUniqueness(db)
   return db
 }

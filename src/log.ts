@@ -24,7 +24,7 @@ export interface DrovrLogger {
   resourceLeaseRequest(resource: string, name: string): void
   resourceLeaseWait(resource: string, name: string): void
   resourceLeaseAcquire(resource: string, name: string): void
-  resourcePortProbe?(
+  resourcePortsProbe?(
     resource: string,
     name: string,
     port: number,
@@ -200,7 +200,7 @@ export function createDrovrLogger(options: DrovrLoggerOptions): DrovrLogger {
     resourceLeaseAcquire(resource: string, name: string) {
       logger.info(`resource.lease.acquire resource=${resource} name=${name}`)
     },
-    resourcePortProbe(
+    resourcePortsProbe(
       resource: string,
       name: string,
       port: number,
@@ -208,7 +208,7 @@ export function createDrovrLogger(options: DrovrLoggerOptions): DrovrLogger {
       status: 'available' | 'in-use' | 'unavailable',
     ) {
       logger.info(
-        `resource.port.probe resource=${resource} name=${name} port=${port} address=${address} status=${status}`,
+        `resource.ports.probe resource=${resource} name=${name} port=${port} address=${address} status=${status}`,
       )
     },
     async close(): Promise<void> {

@@ -322,16 +322,15 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
                     const conflict = db
                       .prepare(
                         `SELECT 1
-                           FROM leases AS held
-                           JOIN resource_ports AS held_port
-                             ON held_port.resource_name = held.resource_name
-                          WHERE held.resource_name <> ?
-                            AND held_port.port IN (
-                              SELECT port FROM resource_ports WHERE resource_name = ?
-                            )
+                           FROM leases AS lease
+                           JOIN resource_ports AS lease_port
+                             ON lease_port.resource_name = lease.resource_name
+                          WHERE lease_port.port IN (
+                            SELECT port FROM resource_ports WHERE resource_name = ?
+                          )
                           LIMIT 1`,
                       )
-                      .get(name, name)
+                      .get(name)
                     canAcquire = conflict === undefined
                   } else {
                     const occupancyRow = db
@@ -379,14 +378,13 @@ export function createDrovr(context: DrovrContext = {}): Drovr {
                 void probeLoopbackPort(port, host)
                   .then((status) => {
                     try {
-                      logger?.resourcePortProbe?.(name, opts.name, port, host, status)
+                      logger?.resourcePortsProbe?.(name, opts.name, port, host, status)
                     } catch {}
                   })
                   .catch(() => {})
               }
             }
           }
-
           try {
             return await fn()
           } finally {

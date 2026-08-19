@@ -373,7 +373,49 @@ export default async function workflow(drovr: Drovr) {
 })
 
 describe('Drovr.resource port declarations', () => {
-  it('blocks overlapping declarations atomically while allowing disjoint declarations', async () => {
+  it('serializes concurrent Leases for different Names on the same Port Resource under implicit capacity one', async () => {
+    const repo = await initRepo()
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from 'drovr'
+import { appendFile } from 'node:fs/promises'
+
+export default async function workflow(drovr: Drovr) {
+  const res = await drovr.resource('single-port', { ports: 4050 })
+  const items = [{ id: 'client-a' }, { id: 'client-b' }]
+
+  await drovr.map(items, { concurrency: 2, name: (item) => item.id }, async (item) => {
+    await res.lease({ name: item.id }, async () => {
+      await appendFile('timeline.txt', \`enter:\${item.id}\\n\`, 'utf8')
+      await new Promise((resolve) => setTimeout(resolve, 80))
+      await appendFile('timeline.txt', \`exit:\${item.id}\\n\`, 'utf8')
+    })
+  })
+}
+`,
+        'utf8',
+      )
+
+      execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })
+      const timeline = (await readFile(join(repo, 'timeline.txt'), 'utf8')).trim().split('\n')
+      expect(timeline).toHaveLength(4)
+      const firstEnter = timeline[0]
+      const firstExit = timeline[1]
+      const secondEnter = timeline[2]
+      const secondExit = timeline[3]
+      const firstId = firstEnter.split(':')[1]
+      const secondId = secondEnter.split(':')[1]
+      expect(firstExit).toBe(`exit:${firstId}`)
+      expect(secondExit).toBe(`exit:${secondId}`)
+      expect(firstId).not.toBe(secondId)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('blocks overlapping declarations atomically across different Resource names while allowing disjoint declarations', async () => {
     const repo = await initRepo()
     try {
       await mkdir(join(repo, '.drovr'), { recursive: true })
@@ -424,7 +466,38 @@ export default async function workflow(drovr: Drovr) {
     }
   })
 
-  it('rejects changing a live declaration and reports loopback probe results', async () => {
+  it('rejects changing a live Port Resource declaration while it has a live Lease', async () => {
+    const repo = await initRepo()
+    try {
+      await mkdir(join(repo, '.drovr'), { recursive: true })
+      await writeFile(
+        join(repo, '.drovr/main.ts'),
+        `import type { Drovr } from 'drovr'
+import { writeFile } from 'node:fs/promises'
+
+export default async function workflow(drovr: Drovr) {
+  const res = await drovr.resource('live-port', { ports: 4200 })
+  await res.lease({ name: 'item' }, async () => {
+    try {
+      await drovr.resource('live-port', { ports: 4201 })
+      await writeFile('changed.txt', 'unexpected-success', 'utf8')
+    } catch (error) {
+      await writeFile('changed.txt', error instanceof Error ? error.message : String(error), 'utf8')
+    }
+  })
+}
+`,
+        'utf8',
+      )
+
+      execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })
+      expect(await readFile(join(repo, 'changed.txt'), 'utf8')).toMatch(/cannot change ports/)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('emits informational resource.ports.probe logs for IPv4 and IPv6 loopback without gating the Lease', async () => {
     const repo = await initRepo()
     try {
       await mkdir(join(repo, '.drovr'), { recursive: true })
@@ -435,17 +508,13 @@ import { createServer } from 'node:net'
 import { writeFile } from 'node:fs/promises'
 
 export default async function workflow(drovr: Drovr) {
-  const res = await drovr.resource('live-port', { ports: 4200 })
+  const res = await drovr.resource('probe-port', { ports: 4250 })
   const server = createServer()
-  await new Promise<void>((resolve) => server.listen(4200, '127.0.0.1', resolve))
-  await res.lease({ name: 'item' }, async () => {
-    try {
-      await drovr.resource('live-port', { ports: 4201 })
-      await writeFile('changed.txt', 'unexpected-success', 'utf8')
-    } catch (error) {
-      await writeFile('changed.txt', error instanceof Error ? error.message : String(error), 'utf8')
-    }
+  await new Promise<void>((resolve) => server.listen(4250, '127.0.0.1', resolve))
+  const result = await res.lease({ name: 'probe-worker' }, async () => {
+    return 'lease-ran-without-gating'
   })
+  await writeFile('result.txt', result, 'utf8')
   server.close()
 }
 `,
@@ -453,13 +522,13 @@ export default async function workflow(drovr: Drovr) {
       )
 
       execFileSync('node', [drovr, 'start'], { cwd: repo, stdio: 'pipe' })
-      expect(await readFile(join(repo, 'changed.txt'), 'utf8')).toMatch(/cannot change ports/)
+      expect(await readFile(join(repo, 'result.txt'), 'utf8')).toBe('lease-ran-without-gating')
       const log = await readFile(join(repo, '.drovr/drovr.log'), 'utf8')
       expect(log).toMatch(
-        /resource\.port\.probe resource=live-port name=item port=4200 address=127\.0\.0\.1 status=in-use/,
+        /resource\.ports\.probe resource=probe-port name=probe-worker port=4250 address=127\.0\.0\.1 status=in-use/,
       )
       expect(log).toMatch(
-        /resource\.port\.probe resource=live-port name=item port=4200 address=::1 status=(available|in-use|unavailable)/,
+        /resource\.ports\.probe resource=probe-port name=probe-worker port=4250 address=::1 status=(available|in-use|unavailable)/,
       )
     } finally {
       await rm(repo, { recursive: true, force: true })
