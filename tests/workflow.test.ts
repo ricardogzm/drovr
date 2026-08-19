@@ -554,6 +554,27 @@ function runDrovrCli(
     }
   }
 }
+function computeMaxConcurrency(
+  logContent: string,
+  enterPrefix: string,
+  exitPrefix: string,
+): number {
+  const lines = logContent
+    .trim()
+    .split('\n')
+    .filter((line) => line.length > 0)
+  let current = 0
+  let max = 0
+  for (const line of lines) {
+    if (line.startsWith(enterPrefix)) {
+      current++
+      if (current > max) max = current
+    } else if (line.startsWith(exitPrefix)) {
+      current--
+    }
+  }
+  return max
+}
 
 beforeAll(() => {
   execFileSync('pnpm', ['run', 'build'], { cwd: root, stdio: 'inherit' })
@@ -571,7 +592,7 @@ describe('Issue #35: The core Workflow completes two Issues through visible Work
           {
             repo: 'acme/widgets',
             number: 101,
-            title: 'First eligible task',
+            title: 'First eligible issue',
             body: 'Fix bug 101 in isolated worktree',
             url: 'https://github.com/acme/widgets/issues/101',
             state: 'OPEN',
@@ -584,7 +605,7 @@ describe('Issue #35: The core Workflow completes two Issues through visible Work
           {
             repo: 'acme/widgets',
             number: 102,
-            title: 'Second eligible task',
+            title: 'Second eligible issue',
             body: 'Fix bug 102 in isolated worktree',
             url: 'https://github.com/acme/widgets/issues/102',
             state: 'OPEN',
@@ -603,10 +624,12 @@ describe('Issue #35: The core Workflow completes two Issues through visible Work
     const failureMarkerPath = join(repo, '.drovr/fail-issue-102.flag')
     await writeFile(failureMarkerPath, 'fail\n', 'utf8')
 
-    // Concurrency witness log for scarce section
+    // Concurrency witness logs: flight tracks map item execution; scarce tracks the leased section
+    const flightWitnessLogPath = join(repo, 'flight-witness.log')
+    await writeFile(flightWitnessLogPath, '', 'utf8')
+
     const witnessLogPath = join(repo, 'scarce-witness.log')
     await writeFile(witnessLogPath, '', 'utf8')
-
     const workflowContent = `import type { Drovr, Issue } from 'drovr'
 import { existsSync } from 'node:fs'
 import { appendFile, readFile, unlink, writeFile } from 'node:fs/promises'
@@ -638,46 +661,52 @@ export default async function workflow(drovr: Drovr): Promise<void> {
     { concurrency: 2, name: (issue) => 'issue-' + issue.number },
     async (issue) => {
       const name = 'issue-' + issue.number
+      const flightWitnessPath = join(rootDir, 'flight-witness.log')
+      await appendFile(flightWitnessPath, 'ENTER ' + name + '\\n', 'utf8')
+      try {
+        // 1. Claim issue
+        await drovr.issues.claim(issue, { name })
 
-      // 1. Claim issue
-      await drovr.issues.claim(issue, { name })
+        // 2. Prepare isolated Worktree
+        const worktree = await drovr.worktree({ name })
 
-      // 2. Prepare isolated Worktree
-      const worktree = await drovr.worktree({ name })
+        // 3. Start or reconnect visible Worker
+        const worker = await drovr.start({ name, cwd: worktree.path })
 
-      // 3. Start or reconnect visible Worker
-      const worker = await drovr.start({ name, cwd: worktree.path })
+        // 4. Send first sequential prompt
+        await worker.prompt('investigate ' + name)
 
-      // 4. Send first sequential prompt
-      await worker.prompt('investigate ' + name)
+        // 5. Scarce capacity-one lease section
+        await scarceResource.lease({ name }, async () => {
+          const witnessPath = join(rootDir, 'scarce-witness.log')
+          await appendFile(witnessPath, 'ENTER ' + name + '\\n', 'utf8')
 
-      // 5. Scarce capacity-one lease section
-      await scarceResource.lease({ name }, async () => {
-        const witnessPath = join(rootDir, 'scarce-witness.log')
-        await appendFile(witnessPath, 'ENTER ' + name + ' ' + Date.now() + '\\n', 'utf8')
+          // Apply observable Workflow effect inside the worktree
+          const effectFilePath = join(worktree.path, 'artifact-' + name + '.txt')
+          await appendFile(effectFilePath, 'progress for ' + name + '\\n', 'utf8')
 
-        // Apply observable Workflow effect inside the worktree
-        const effectFilePath = join(worktree.path, 'artifact-' + name + '.txt')
-        await appendFile(effectFilePath, 'progress for ' + name + '\\n', 'utf8')
+          execFileSync('git', ['add', 'artifact-' + name + '.txt'], { cwd: worktree.path })
+          execFileSync('git', ['commit', '-m', 'update artifact for ' + name], {
+            cwd: worktree.path,
+          })
+          await Promise.resolve()
+          await appendFile(witnessPath, 'EXIT ' + name + '\\n', 'utf8')
+        })
 
-        execFileSync('git', ['add', 'artifact-' + name + '.txt'], { cwd: worktree.path })
-        execFileSync('git', ['commit', '-m', 'update artifact for ' + name], { cwd: worktree.path })
-        // Microtask tick to ensure asynchronous event loop yield
-        await Promise.resolve()
-        await appendFile(witnessPath, 'EXIT ' + name + ' ' + Date.now() + '\\n', 'utf8')
-      })
+        // 6. Send second sequential prompt
+        await worker.prompt('finalize ' + name)
 
-      // 6. Send second sequential prompt
-      await worker.prompt('finalize ' + name)
+        // 7. Check failure marker
+        const flagPath = join(rootDir, '.drovr/fail-issue-102.flag')
+        if (issue.number === 102 && existsSync(flagPath)) {
+          throw new Error('Simulated failure in item issue-102')
+        }
 
-      // 7. Check failure marker
-      const flagPath = join(rootDir, '.drovr/fail-issue-102.flag')
-      if (issue.number === 102 && existsSync(flagPath)) {
-        throw new Error('Simulated failure in item issue-102')
+        // 8. Close Claimed Issue
+        await drovr.issues.close(issue)
+      } finally {
+        await appendFile(flightWitnessPath, 'EXIT ' + name + '\\n', 'utf8')
       }
-
-      // 8. Close Claimed Issue
-      await drovr.issues.close(issue)
     }
   )
 }
@@ -721,7 +750,7 @@ export default async function workflow(drovr: Drovr): Promise<void> {
     const wt102Log = runGit(join(repo, '.worktrees/issue-102'), ['log', '-1', '--oneline'])
     expect(wt102Log).toContain('update artifact for issue-102')
 
-    // --- Assert Herdr state after Run 1 ---
+    // --- Assert Herdr state after Run 1 (workspaces, agents, and panes exist) ---
     const herdrState1 = await getHerdrState()
     expect(herdrState1.workspaces).toHaveLength(2)
     expect(herdrState1.agents).toHaveLength(2)
@@ -731,31 +760,45 @@ export default async function workflow(drovr: Drovr): Promise<void> {
     expect(agent101_run1?.prompts).toEqual(['investigate issue-101', 'finalize issue-101'])
     expect(agent102_run1?.prompts).toEqual(['investigate issue-102', 'finalize issue-102'])
 
-    // --- Assert Scarce Resource Serialization ---
-    const witnessLines1 = (await readFile(witnessLogPath, 'utf8'))
-      .trim()
-      .split('\n')
-      .filter((l) => l.length > 0)
-    let currentOccupants = 0
-    let maxOccupants = 0
-    for (const line of witnessLines1) {
-      if (line.startsWith('ENTER')) {
-        currentOccupants++
-        if (currentOccupants > maxOccupants) maxOccupants = currentOccupants
-      } else if (line.startsWith('EXIT')) {
-        currentOccupants--
-      }
-    }
-    expect(maxOccupants).toBe(1)
+    // Assert unfinished Name's Herdr pane remains available
+    expect(agent102_run1?.pane_id).toBeDefined()
+    const pane102_run1 = herdrState1.panes?.find((p) => p.pane_id === agent102_run1?.pane_id)
+    expect(pane102_run1).toBeDefined()
+    expect(pane102_run1?.cwd).toBe(join(repo, '.worktrees/issue-102'))
+
+    // --- Assert Concurrency & Scarce Resource Serialization ---
+    // Both items were in flight simultaneously outside the scarce section
+    const maxInFlight1 = computeMaxConcurrency(
+      await readFile(flightWitnessLogPath, 'utf8'),
+      'ENTER',
+      'EXIT',
+    )
+    expect(maxInFlight1).toBe(2)
+
+    // Scarce section admitted only one item at a time
+    const maxScarce1 = computeMaxConcurrency(
+      await readFile(witnessLogPath, 'utf8'),
+      'ENTER',
+      'EXIT',
+    )
+    expect(maxScarce1).toBe(1)
 
     // --- Assert Semantic Logs after Run 1 ---
     const logContent1 = await readFile(join(repo, '.drovr/drovr.log'), 'utf8')
     const logLines1 = logContent1.trim().split('\n')
 
     expect(logLines1.some((l) => l.includes('INFO start.begin mode=fresh'))).toBe(true)
-    expect(logLines1.some((l) => l.includes('INFO map.item.start name=issue-101'))).toBe(true)
-    expect(logLines1.some((l) => l.includes('INFO map.item.start name=issue-102'))).toBe(true)
-    expect(logLines1.some((l) => l.includes('INFO map.item.complete name=issue-101'))).toBe(true)
+
+    const start101Idx = logLines1.findIndex((l) => l.includes('INFO map.item.start name=issue-101'))
+    const start102Idx = logLines1.findIndex((l) => l.includes('INFO map.item.start name=issue-102'))
+    const complete101Idx = logLines1.findIndex((l) =>
+      l.includes('INFO map.item.complete name=issue-101'),
+    )
+    expect(start101Idx).toBeGreaterThanOrEqual(0)
+    expect(start102Idx).toBeGreaterThanOrEqual(0)
+    expect(start101Idx).toBeLessThan(complete101Idx)
+    expect(start102Idx).toBeLessThan(complete101Idx)
+
     expect(
       logLines1.some(
         (l) =>
@@ -789,7 +832,7 @@ export default async function workflow(drovr: Drovr): Promise<void> {
     expect(issue102_afterRun2?.state).toBe('CLOSED')
     expect(issue102_afterRun2?.assignees).toEqual([{ login: 'drovr-bot' }])
 
-    // --- Assert Herdr state after Run 2 (no duplicate workspaces or agents) ---
+    // --- Assert Herdr state after Run 2 (no duplicate creation; exact pane preservation and reuse) ---
     const herdrState2 = await getHerdrState()
     expect(herdrState2.workspaces).toHaveLength(2)
     expect(herdrState2.agents).toHaveLength(2)
@@ -800,14 +843,20 @@ export default async function workflow(drovr: Drovr): Promise<void> {
     // issue-101 was skipped on resume -> not re-prompted
     expect(agent101_run2?.prompts).toEqual(['investigate issue-101', 'finalize issue-101'])
 
-    // issue-102 reconnected the existing worker and received prompts
+    // issue-102 reconnected the existing worker and reused the exact same pane_id
+    expect(agent102_run2?.pane_id).toBe(agent102_run1?.pane_id)
+    const pane102_run2 = herdrState2.panes?.find((p) => p.pane_id === agent102_run1?.pane_id)
+    expect(pane102_run2).toBeDefined()
+    expect(pane102_run2?.pane_id).toBe(pane102_run1?.pane_id)
+    expect(pane102_run2?.workspace_id).toBe(pane102_run1?.workspace_id)
+    expect(pane102_run2?.cwd).toBe(join(repo, '.worktrees/issue-102'))
+
     expect(agent102_run2?.prompts).toEqual([
       'investigate issue-102',
       'finalize issue-102',
       'investigate issue-102',
       'finalize issue-102',
     ])
-
     // --- Assert Git state after Run 2 ---
     expect(runGit(repo, ['branch', '--show-current'])).toBe('main')
     const artifact101 = await readFile(
@@ -851,7 +900,7 @@ export default async function workflow(drovr: Drovr): Promise<void> {
           {
             repo: 'acme/widgets',
             number: 201,
-            title: 'Port consumer task A',
+            title: 'Serve port issue 201',
             body: 'Run server on port 9090',
             url: 'https://github.com/acme/widgets/issues/201',
             state: 'OPEN',
@@ -864,7 +913,7 @@ export default async function workflow(drovr: Drovr): Promise<void> {
           {
             repo: 'acme/widgets',
             number: 202,
-            title: 'Port consumer task B',
+            title: 'Serve port issue 202',
             body: 'Run server on port 9090',
             url: 'https://github.com/acme/widgets/issues/202',
             state: 'OPEN',
@@ -878,6 +927,9 @@ export default async function workflow(drovr: Drovr): Promise<void> {
       })
 
     await mkdir(join(repo, '.drovr'), { recursive: true })
+
+    const portFlightWitnessLog = join(repo, 'port-flight-witness.log')
+    await writeFile(portFlightWitnessLog, '', 'utf8')
 
     const portWitnessLog = join(repo, 'port-witness.log')
     await writeFile(portWitnessLog, '', 'utf8')
@@ -898,21 +950,27 @@ export default async function workflow(drovr: Drovr): Promise<void> {
     { concurrency: 2, name: (issue) => 'issue-' + issue.number },
     async (issue) => {
       const name = 'issue-' + issue.number
-      await drovr.issues.claim(issue, { name })
-      const worktree = await drovr.worktree({ name })
-      const worker = await drovr.start({ name, cwd: worktree.path })
+      const flightWitnessPath = join(rootDir, 'port-flight-witness.log')
+      await appendFile(flightWitnessPath, 'ENTER ' + name + '\\n', 'utf8')
+      try {
+        await drovr.issues.claim(issue, { name })
+        const worktree = await drovr.worktree({ name })
+        const worker = await drovr.start({ name, cwd: worktree.path })
 
-      await worker.prompt('prepare port task ' + name)
+        await worker.prompt('prepare port work ' + name)
 
-      await portResource.lease({ name }, async () => {
-        const witness = join(rootDir, 'port-witness.log')
-        await appendFile(witness, 'ENTER ' + name + ' ' + Date.now() + '\\n', 'utf8')
-        await Promise.resolve()
-        await appendFile(witness, 'EXIT ' + name + ' ' + Date.now() + '\\n', 'utf8')
-      })
+        await portResource.lease({ name }, async () => {
+          const witness = join(rootDir, 'port-witness.log')
+          await appendFile(witness, 'ENTER ' + name + '\\n', 'utf8')
+          await Promise.resolve()
+          await appendFile(witness, 'EXIT ' + name + '\\n', 'utf8')
+        })
 
-      await worker.prompt('cleanup port task ' + name)
-      await drovr.issues.close(issue)
+        await worker.prompt('cleanup port work ' + name)
+        await drovr.issues.close(issue)
+      } finally {
+        await appendFile(flightWitnessPath, 'EXIT ' + name + '\\n', 'utf8')
+      }
     }
   )
 }
@@ -920,8 +978,8 @@ export default async function workflow(drovr: Drovr): Promise<void> {
     await writeFile(join(repo, '.drovr/main.ts'), workflowContent, 'utf8')
 
     const res = runDrovrCli(repo, ['start'], binDir, ghStatePath, herdrStatePath)
+    expect(res.stderr).toBe('')
     expect(res.status).toBe(0)
-
     const ghState = await getGhState()
     expect(ghState.issues?.every((i) => i.state === 'CLOSED')).toBe(true)
 
@@ -929,21 +987,31 @@ export default async function workflow(drovr: Drovr): Promise<void> {
     expect(herdrState.workspaces).toHaveLength(2)
     expect(herdrState.agents).toHaveLength(2)
 
+    // Verify both items were in flight simultaneously outside the scarce section
+    const maxInFlightPort = computeMaxConcurrency(
+      await readFile(portFlightWitnessLog, 'utf8'),
+      'ENTER',
+      'EXIT',
+    )
+    expect(maxInFlightPort).toBe(2)
+
     // Verify port serialization (maximum simultaneous occupants was 1)
-    const witnessLines = (await readFile(portWitnessLog, 'utf8'))
-      .trim()
-      .split('\n')
-      .filter((l) => l.length > 0)
-    let currentOccupants = 0
-    let maxOccupants = 0
-    for (const line of witnessLines) {
-      if (line.startsWith('ENTER')) {
-        currentOccupants++
-        if (currentOccupants > maxOccupants) maxOccupants = currentOccupants
-      } else if (line.startsWith('EXIT')) {
-        currentOccupants--
-      }
-    }
-    expect(maxOccupants).toBe(1)
+    const maxPortOccupants = computeMaxConcurrency(
+      await readFile(portWitnessLog, 'utf8'),
+      'ENTER',
+      'EXIT',
+    )
+    expect(maxPortOccupants).toBe(1)
+
+    // Verify semantic logs prove both items started before either completed
+    const portLogContent = await readFile(join(repo, '.drovr/drovr.log'), 'utf8')
+    const portLogLines = portLogContent.trim().split('\n')
+    const start201Idx = portLogLines.findIndex((l) => l.includes('map.item.start name=issue-201'))
+    const start202Idx = portLogLines.findIndex((l) => l.includes('map.item.start name=issue-202'))
+    const firstCompleteIdx = portLogLines.findIndex((l) => l.includes('map.item.complete'))
+    expect(start201Idx).toBeGreaterThanOrEqual(0)
+    expect(start202Idx).toBeGreaterThanOrEqual(0)
+    expect(start201Idx).toBeLessThan(firstCompleteIdx)
+    expect(start202Idx).toBeLessThan(firstCompleteIdx)
   })
 })
