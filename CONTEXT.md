@@ -60,6 +60,10 @@ _Avoid_: complete, finish
 A Workflow call that releases a Claim without closing or unassigning the Issue, handing responsibility to the retained assignee rather than requeueing it.
 _Avoid_: unclaim, requeue
 
+**Package Release**:
+A numbered, published version of Drovr made available to package users. It is distinct from Release, the Workflow call that gives up a Claim.
+_Avoid_: Release (when meaning package publication), deployment
+
 **Completion**:
 A Name whose map callback returned, recorded in the project database so `--resume` skips it. A throw is not a Completion.
 _Avoid_: Close, checkpoint, step log
