@@ -14,4 +14,4 @@ Single-context: `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/
 
 ## Commits
 
-Writes commit messages using Conventional Commits.
+Prepare, create, amend, or squash commits with the `commit` skill.

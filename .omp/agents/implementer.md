@@ -35,4 +35,4 @@ You are the **Implementer** agent. Your goal is to take a GitHub issue number or
    - Ensure there are no type errors, regressions, or broken contracts.
 
 5. **Commit**:
-   - Commit your changes to the current branch using Conventional Commits as outlined in `AGENTS.md` (e.g. `feat: ...`, `fix: ...`).
+   - Commit with the `commit` skill (`skill://commit`).
