@@ -9,6 +9,7 @@ import {
 } from './release-metadata'
 import { runSetup } from './setup'
 import { runStart } from './start'
+import { verifyPackageTarball } from './tarball-verify'
 function formatCliErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     try {
@@ -202,6 +203,61 @@ async function main(argv: string[]): Promise<number> {
         githubNotes,
       })
       process.stdout.write(notes)
+      return 0
+    }
+    if (
+      subcommand === 'verify-pack' ||
+      subcommand === 'pack-verify' ||
+      subcommand === 'verify-tarball' ||
+      subcommand === 'verify'
+    ) {
+      let cwd = process.cwd()
+      let tarball: string | undefined
+      let skipBuild = false
+      let keepTemp = false
+      let json = false
+
+      for (let i = 0; i < subArgs.length; i++) {
+        const arg = subArgs[i]
+        if (arg === '--cwd' && i + 1 < subArgs.length) {
+          cwd = subArgs[++i]
+        } else if (arg === '--dir' && i + 1 < subArgs.length) {
+          cwd = subArgs[++i]
+        } else if (arg === '--tarball' && i + 1 < subArgs.length) {
+          tarball = subArgs[++i]
+        } else if (arg === '--skip-build') {
+          skipBuild = true
+        } else if (arg === '--keep-temp' || arg === '--keep') {
+          keepTemp = true
+        } else if (arg === '--json') {
+          json = true
+        } else {
+          console.error(`error: unexpected argument for ${subcommand}: ${arg}`)
+          return 1
+        }
+      }
+
+      const result = await verifyPackageTarball({
+        cwd,
+        tarball,
+        skipBuild,
+        keepTemp,
+      })
+
+      if (!result.valid) {
+        if (json) {
+          console.log(JSON.stringify(result, null, 2))
+        } else {
+          console.error(`error: ${result.error}`)
+        }
+        return 1
+      }
+
+      if (json) {
+        console.log(JSON.stringify(result, null, 2))
+      } else {
+        console.log(`Verified npm tarball (${result.files.length} files in ${result.tarballPath})`)
+      }
       return 0
     }
 
