@@ -4,6 +4,8 @@ import {
   classifyCommits,
   getGitCommitsInRange,
   parseCommitMessage,
+  reconcileReleasePullRequest,
+  type ReconcilePrResult,
   renderReleaseNotes,
   resolveRepoSlug,
 } from './release-metadata'
@@ -203,6 +205,65 @@ async function main(argv: string[]): Promise<number> {
         githubNotes,
       })
       process.stdout.write(notes)
+      return 0
+    }
+    if (subcommand === 'reconcile-pr' || subcommand === 'reconcile-release-pr') {
+      let title: string | null = null
+      let body: string | null = null
+      let repo: string | null = null
+      let cwd = process.cwd()
+      let json = false
+
+      for (let i = 0; i < subArgs.length; i++) {
+        const arg = subArgs[i]
+        if (arg === '--title' && i + 1 < subArgs.length) {
+          title = subArgs[++i]
+        } else if (arg === '--body' && i + 1 < subArgs.length) {
+          body = subArgs[++i]
+        } else if (arg === '--body-file' && i + 1 < subArgs.length) {
+          const filePath = subArgs[++i]
+          try {
+            body = readFileSync(filePath, 'utf8')
+          } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            console.error(`error: failed to read body file: ${errMsg}`)
+            return 1
+          }
+        } else if (arg === '--repo' && i + 1 < subArgs.length) {
+          repo = subArgs[++i]
+        } else if (arg === '--cwd' && i + 1 < subArgs.length) {
+          cwd = subArgs[++i]
+        } else if (arg === '--json') {
+          json = true
+        } else {
+          console.error(`error: unexpected argument for reconcile-pr: ${arg}`)
+          return 1
+        }
+      }
+
+      let result: ReconcilePrResult
+      try {
+        result = reconcileReleasePullRequest({
+          title,
+          body,
+          repo,
+          cwd,
+        })
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err)
+        console.error(`error: ${errMsg}`)
+        return 1
+      }
+
+      if (json) {
+        console.log(JSON.stringify(result, null, 2))
+      } else {
+        if (result.action === 'close') {
+          console.log(`Action: close (${result.reason})`)
+        } else {
+          process.stdout.write(result.body)
+        }
+      }
       return 0
     }
     if (

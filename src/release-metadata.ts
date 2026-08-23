@@ -305,3 +305,114 @@ export function renderReleaseNotes(options: RenderReleaseNotesOptions): string {
 
   return sections.join('\n\n') + '\n'
 }
+
+export function getLatestReleaseTag(cwd: string): string | null {
+  try {
+    const tagsOutput = runGit(cwd, ['tag', '-l', 'v*', '--sort=-v:refname'])
+    const tags = tagsOutput
+      .split(/\r?\n/)
+      .map((t) => t.trim())
+      .filter(Boolean)
+    return tags[0] ?? null
+  } catch {
+    return null
+  }
+}
+
+export function extractVersionFromPr(title?: string | null, body?: string | null): string {
+  if (title) {
+    const match =
+      /release\s+v?([0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?)/i.exec(title) ||
+      /([0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?)/.exec(title)
+    if (match && match[1]) {
+      return match[1]
+    }
+  }
+  if (body) {
+    const match = /##\s+\[?v?([0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?)/i.exec(body)
+    if (match && match[1]) {
+      return match[1]
+    }
+  }
+  throw new Error(
+    'Could not extract release version from pull request title or body. PR title or body must contain a valid SemVer version.',
+  )
+}
+
+export function formatReleasePullRequestBody(
+  originalBody: string,
+  notes: string,
+  version: string,
+): string {
+  const firstDelim = originalBody.indexOf('---')
+  const lastDelim = originalBody.lastIndexOf('---')
+
+  let header = ':robot: I have created a release *beep* *boop*\n---'
+  let footer =
+    '---\nThis PR was generated with [Release Please](https://github.com/googleapis/release-please). See [documentation](https://github.com/googleapis/release-please#readme).'
+
+  if (firstDelim !== -1 && lastDelim !== -1 && firstDelim !== lastDelim) {
+    header = originalBody.slice(0, firstDelim + 3).trimEnd()
+    footer = originalBody.slice(lastDelim).trimStart()
+  }
+
+  const cleanNotes = notes.trim()
+  return `${header}\n\n\n## ${version}\n\n${cleanNotes}\n\n${footer}\n`
+}
+
+const USER_FACING_CATEGORY_REGEX = /(?:^|\n)### (?:Breaking Changes|Added|Changed|Fixed|Removed)/
+
+export interface ReconcilePrOptions {
+  title?: string | null
+  body?: string | null
+  cwd?: string
+  repo?: string | null
+}
+
+export interface ReconcilePrResult {
+  action: 'update' | 'close'
+  version: string
+  tag: string
+  prevTag: string | null
+  body: string
+  reason?: string
+}
+
+export function reconcileReleasePullRequest(options: ReconcilePrOptions): ReconcilePrResult {
+  const cwd = options.cwd ?? process.cwd()
+  const version = extractVersionFromPr(options.title, options.body)
+  const tag = `v${version}`
+  const prevTag = getLatestReleaseTag(cwd)
+  const from = prevTag
+  const resolvedRepo = resolveRepoSlug(cwd, options.repo)
+
+  const commits = getGitCommitsInRange(cwd, { from, to: 'HEAD' })
+  const notes = renderReleaseNotes({
+    commits,
+    repo: resolvedRepo,
+    tag,
+    prevTag,
+  })
+
+  const hasUserFacingChanges = USER_FACING_CATEGORY_REGEX.test(notes)
+  if (!hasUserFacingChanges) {
+    return {
+      action: 'close',
+      version,
+      tag,
+      prevTag,
+      body: '',
+      reason:
+        'No user-facing changes (Breaking Changes, Added, Changed, Fixed, Removed) in proposed range.',
+    }
+  }
+
+  const updatedBody = formatReleasePullRequestBody(options.body ?? '', notes, version)
+  return {
+    action: 'update',
+    version,
+    tag,
+    prevTag,
+    body: updatedBody,
+  }
+}
