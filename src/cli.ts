@@ -11,6 +11,7 @@ import {
 } from './release-metadata'
 import { runSetup } from './setup'
 import { runStart } from './start'
+import { prepareDraftRelease } from './release-prepare'
 import { verifyPackageTarball } from './tarball-verify'
 function formatCliErrorMessage(error: unknown): string {
   if (error instanceof Error) {
@@ -320,6 +321,91 @@ async function main(argv: string[]): Promise<number> {
         console.log(`Verified npm tarball (${result.files.length} files in ${result.tarballPath})`)
       }
       return 0
+    }
+    if (
+      subcommand === 'prepare' ||
+      subcommand === 'prepare-release' ||
+      subcommand === 'prepare-draft'
+    ) {
+      let tag: string | null = null
+      let version: string | null = null
+      let sha: string | null = null
+      let prevTag: string | null = null
+      let repo: string | null = null
+      let githubNotes: string | null = null
+      let githubNotesFile: string | null = null
+      let githubToken: string | null = null
+      let githubApiUrl: string | null = null
+      let cwd = process.cwd()
+      let json = false
+
+      for (let i = 0; i < subArgs.length; i++) {
+        const arg = subArgs[i]
+        if (arg === '--tag' && i + 1 < subArgs.length) {
+          tag = subArgs[++i]
+        } else if (arg === '--version' && i + 1 < subArgs.length) {
+          version = subArgs[++i]
+        } else if ((arg === '--sha' || arg === '--commit') && i + 1 < subArgs.length) {
+          sha = subArgs[++i]
+        } else if (arg === '--prev-tag' && i + 1 < subArgs.length) {
+          prevTag = subArgs[++i]
+        } else if (arg === '--repo' && i + 1 < subArgs.length) {
+          repo = subArgs[++i]
+        } else if (arg === '--github-notes' && i + 1 < subArgs.length) {
+          githubNotes = subArgs[++i]
+        } else if (arg === '--github-notes-file' && i + 1 < subArgs.length) {
+          githubNotesFile = subArgs[++i]
+        } else if (arg === '--github-token' && i + 1 < subArgs.length) {
+          githubToken = subArgs[++i]
+        } else if (arg === '--github-api-url' && i + 1 < subArgs.length) {
+          githubApiUrl = subArgs[++i]
+        } else if ((arg === '--cwd' || arg === '--dir') && i + 1 < subArgs.length) {
+          cwd = subArgs[++i]
+        } else if (arg === '--json') {
+          json = true
+        } else {
+          console.error(`error: unexpected argument for ${subcommand}: ${arg}`)
+          return 1
+        }
+      }
+
+      try {
+        const result = await prepareDraftRelease({
+          tag,
+          version,
+          sha,
+          prevTag,
+          repo,
+          githubNotes,
+          githubNotesFile,
+          githubToken,
+          githubApiUrl,
+          cwd,
+        })
+
+        if (json) {
+          console.log(JSON.stringify(result, null, 2))
+        } else {
+          if (result.action === 'created') {
+            console.log(`Created draft GitHub Release ${result.tag} (id: ${result.releaseId})`)
+          } else if (result.action === 'updated') {
+            console.log(`Updated draft GitHub Release ${result.tag} (id: ${result.releaseId})`)
+          } else if (result.action === 'already-prepared') {
+            console.log(
+              `Draft GitHub Release ${result.tag} is already prepared and up to date (id: ${result.releaseId})`,
+            )
+          } else if (result.action === 'already-published') {
+            console.log(
+              `GitHub Release ${result.tag} is already published (id: ${result.releaseId})`,
+            )
+          }
+        }
+        return 0
+      } catch (err) {
+        const errMsg = formatCliErrorMessage(err)
+        console.error(`error: ${errMsg}`)
+        return 1
+      }
     }
 
     console.error(`error: unknown package-release subcommand ${subcommand ?? '(none)'}`)

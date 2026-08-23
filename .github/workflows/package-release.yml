@@ -132,3 +132,17 @@ jobs:
             UPDATED_BODY=$(node -e 'console.log(JSON.parse(process.argv[1]).body)' "$RESULT")
             gh pr edit "$PR_NUMBER" --body "$UPDATED_BODY"
           fi
+
+      - name: Prepare draft GitHub Release
+        if: steps.release.outputs.releases_created == 'true' || steps.release.outputs.tag_name
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          node ./dist/cli.mjs package-release prepare \
+            --tag "$RELEASE_TAG" \
+            --version "$RELEASE_VERSION" \
+            --sha "$TARGET_SHA"
