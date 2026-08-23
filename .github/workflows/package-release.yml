@@ -81,6 +81,11 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    outputs:
+      releases_created: ${{ steps.release.outputs.releases_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+      sha: ${{ github.sha }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -146,3 +151,74 @@ jobs:
             --tag "$RELEASE_TAG" \
             --version "$RELEASE_VERSION" \
             --sha "$TARGET_SHA"
+
+  publish-package:
+    runs-on: ubuntu-latest
+    needs: release-please
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && (needs.release-please.outputs.releases_created == 'true' || needs.release-please.outputs.tag_name != '')
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout repository at tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+          fetch-depth: 0
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Lint
+        run: pnpm run lint
+
+      - name: Check formatting
+        run: pnpm run fmt:check
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Build drovr
+        run: pnpm run build
+
+      - name: Verify package tarball
+        id: verify-pack
+        run: |
+          set -euo pipefail
+          TARBALL_JSON=$(node ./dist/cli.mjs package-release verify-pack --keep-temp --json)
+          TARBALL_PATH=$(node -e 'console.log(JSON.parse(process.argv[1]).tarballPath)' "$TARBALL_JSON")
+          echo "tarball_path=$TARBALL_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to npm and finalize GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          RELEASE_VERSION: ${{ needs.release-please.outputs.version }}
+          TARGET_SHA: ${{ needs.release-please.outputs.sha }}
+          TARBALL_PATH: ${{ steps.verify-pack.outputs.tarball_path }}
+        run: |
+          set -euo pipefail
+          if [ -n "${NPM_TOKEN:-}" ]; then
+            export NODE_AUTH_TOKEN="$NPM_TOKEN"
+          fi
+          node ./dist/cli.mjs package-release publish \
+            --tag "$RELEASE_TAG" \
+            --version "$RELEASE_VERSION" \
+            --sha "$TARGET_SHA" \
+            --tarball "$TARBALL_PATH"

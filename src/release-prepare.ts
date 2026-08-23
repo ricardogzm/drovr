@@ -295,7 +295,7 @@ export class GitHubApiClient {
   }
 }
 
-function resolveVersionAndTag(
+export function resolveVersionAndTag(
   cwd: string,
   options: { version?: string | null; tag?: string | null },
 ): { version: string; tag: string } {

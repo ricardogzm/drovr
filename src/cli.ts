@@ -12,6 +12,7 @@ import {
 import { runSetup } from './setup'
 import { runStart } from './start'
 import { prepareDraftRelease } from './release-prepare'
+import { publishPackageRelease } from './release-publish'
 import { verifyPackageTarball } from './tarball-verify'
 function formatCliErrorMessage(error: unknown): string {
   if (error instanceof Error) {
@@ -397,6 +398,112 @@ async function main(argv: string[]): Promise<number> {
           } else if (result.action === 'already-published') {
             console.log(
               `GitHub Release ${result.tag} is already published (id: ${result.releaseId})`,
+            )
+          }
+        }
+        return 0
+      } catch (err) {
+        const errMsg = formatCliErrorMessage(err)
+        console.error(`error: ${errMsg}`)
+        return 1
+      }
+    }
+    if (subcommand === 'publish') {
+      let tag: string | null = null
+      let version: string | null = null
+      let sha: string | null = null
+      let prevTag: string | null = null
+      let repo: string | null = null
+      let tarball: string | null = null
+      let npmRegistry: string | null = null
+      let npmToken: string | null = null
+      let npmTag: string | null = null
+      let npmAccess: 'public' | 'restricted' | null = null
+      let provenance: boolean | undefined = undefined
+      let dryRun = false
+      let skipChecks = false
+      let githubToken: string | null = null
+      let githubApiUrl: string | null = null
+      let cwd = process.cwd()
+      let json = false
+
+      for (let i = 0; i < subArgs.length; i++) {
+        const arg = subArgs[i]
+        if (arg === '--tag' && i + 1 < subArgs.length) {
+          tag = subArgs[++i]
+        } else if (arg === '--version' && i + 1 < subArgs.length) {
+          version = subArgs[++i]
+        } else if ((arg === '--sha' || arg === '--commit') && i + 1 < subArgs.length) {
+          sha = subArgs[++i]
+        } else if (arg === '--prev-tag' && i + 1 < subArgs.length) {
+          prevTag = subArgs[++i]
+        } else if (arg === '--repo' && i + 1 < subArgs.length) {
+          repo = subArgs[++i]
+        } else if (arg === '--tarball' && i + 1 < subArgs.length) {
+          tarball = subArgs[++i]
+        } else if ((arg === '--npm-registry' || arg === '--registry') && i + 1 < subArgs.length) {
+          npmRegistry = subArgs[++i]
+        } else if ((arg === '--npm-token' || arg === '--token') && i + 1 < subArgs.length) {
+          npmToken = subArgs[++i]
+        } else if (arg === '--npm-tag' && i + 1 < subArgs.length) {
+          npmTag = subArgs[++i]
+        } else if (arg === '--npm-access' && i + 1 < subArgs.length) {
+          const acc = subArgs[++i]
+          if (acc === 'public' || acc === 'restricted') {
+            npmAccess = acc
+          }
+        } else if (arg === '--provenance') {
+          provenance = true
+        } else if (arg === '--no-provenance') {
+          provenance = false
+        } else if (arg === '--dry-run') {
+          dryRun = true
+        } else if (arg === '--skip-checks') {
+          skipChecks = true
+        } else if (arg === '--github-token' && i + 1 < subArgs.length) {
+          githubToken = subArgs[++i]
+        } else if (arg === '--github-api-url' && i + 1 < subArgs.length) {
+          githubApiUrl = subArgs[++i]
+        } else if ((arg === '--cwd' || arg === '--dir') && i + 1 < subArgs.length) {
+          cwd = subArgs[++i]
+        } else if (arg === '--json') {
+          json = true
+        } else {
+          console.error(`error: unexpected argument for ${subcommand}: ${arg}`)
+          return 1
+        }
+      }
+
+      try {
+        const result = await publishPackageRelease({
+          tag,
+          version,
+          sha,
+          prevTag,
+          repo,
+          tarball,
+          npmRegistry,
+          npmToken,
+          npmTag,
+          npmAccess,
+          provenance,
+          dryRun,
+          skipChecks,
+          githubToken,
+          githubApiUrl,
+          cwd,
+        })
+
+        if (json) {
+          console.log(JSON.stringify(result, null, 2))
+        } else {
+          if (result.action === 'published') {
+            console.log(
+              `Published ${result.tag} (${result.version}) to npm and finalized GitHub Release (id: ${result.releaseId})`,
+            )
+          } else if (result.action === 'already-published') {
+            console.log(
+              `Package Release ${result.tag} (${result.version}) is already published to npm and GitHub (id: ${result.releaseId})`,
             )
           }
         }
